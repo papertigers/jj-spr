@@ -11,8 +11,6 @@
 //! changed unless every merged change can be abandoned safely, and it never
 //! rebases merely because the main branch moved; `jj rebase` owns that.
 
-use std::collections::HashMap;
-
 use git2::Oid;
 
 use crate::{
@@ -91,9 +89,9 @@ pub async fn sync(
         )?;
         return Ok(());
     }
-    require_linear(jj, &commits)?;
+    jj.require_linear(&commits, "syncing")?;
 
-    let change_ids = change_ids_for(jj, &commits)?;
+    let change_ids = jj.change_ids_for(&commits)?;
     let mut changes = Vec::new();
     for commit in commits {
         let status = match commit.pull_request_number {
@@ -255,7 +253,7 @@ async fn status_of(
             "GitHub did not report its final version".into(),
         ));
     };
-    let head_tree = match tree_of(jj, head) {
+    let head_tree = match jj.tree_if_present(head) {
         Some(tree) => tree,
         None => {
             // Not in the local repository (for example, it was pushed from
@@ -269,7 +267,7 @@ async fn status_of(
                     .arg(head.to_string()),
             )
             .await;
-            match tree_of(jj, head) {
+            match jj.tree_if_present(head) {
                 Some(tree) => tree,
                 None => {
                     return Ok(Status::MergedWithDifferences(
@@ -311,60 +309,4 @@ fn already_contains(
         return Ok(false);
     }
     Ok(merged.write_tree_to(repo)? == published)
-}
-
-fn tree_of(jj: &crate::jj::Jujutsu, commit: Oid) -> Option<Oid> {
-    // Objects fetched since the repository was opened may be in a new pack.
-    if let Ok(odb) = jj.git_repo.odb() {
-        let _ = odb.refresh();
-    }
-    jj.git_repo.find_commit(commit).ok().map(|c| c.tree_id())
-}
-
-/// `sync` handles one straight line of changes, each with a single parent.
-fn require_linear(jj: &crate::jj::Jujutsu, commits: &[PreparedCommit]) -> Result<()> {
-    for (i, commit) in commits.iter().enumerate() {
-        let parents = jj.git_repo.find_commit(commit.oid)?.parent_count();
-        let follows_previous = i == 0 || commit.parent_oid == commits[i - 1].oid;
-        if parents != 1 || !follows_previous {
-            return Err(Error::new(format!(
-                "Not syncing: the changes up to the target are not a single line of \
-                 changes ({} {}). Run `jj spr sync -r <top of one stack>` for each stack.",
-                commit.short_id,
-                if parents != 1 {
-                    "is a merge"
-                } else {
-                    "is on a separate branch"
-                }
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Map each commit to its change ID with one jj invocation.
-fn change_ids_for(
-    jj: &crate::jj::Jujutsu,
-    commits: &[PreparedCommit],
-) -> Result<HashMap<Oid, String>> {
-    let revset = commits
-        .iter()
-        .map(|c| c.oid.to_string())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let listing = jj.run([
-        "log",
-        "--no-graph",
-        "-r",
-        &revset,
-        "-T",
-        "commit_id ++ \" \" ++ change_id ++ \"\\n\"",
-    ])?;
-    Ok(listing
-        .lines()
-        .filter_map(|line| {
-            let (commit, change) = line.split_once(' ')?;
-            Some((Oid::from_str(commit).ok()?, change.trim().to_string()))
-        })
-        .collect())
 }

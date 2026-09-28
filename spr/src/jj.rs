@@ -332,6 +332,67 @@ impl Jujutsu {
         Ok(output.trim().to_string())
     }
 
+    /// Require `commits` (bottom first) to be one straight line of changes,
+    /// each with a single parent. `what` names the command, for the error.
+    pub fn require_linear(&self, commits: &[PreparedCommit], what: &str) -> Result<()> {
+        for (i, commit) in commits.iter().enumerate() {
+            let parents = self.git_repo.find_commit(commit.oid)?.parent_count();
+            let follows_previous = i == 0 || commit.parent_oid == commits[i - 1].oid;
+            if parents != 1 || !follows_previous {
+                return Err(Error::new(format!(
+                    "Not {what}: the changes up to the target are not a single line of \
+                     changes ({} {}). Pass `-r <top of one stack>` to pick one stack.",
+                    commit.short_id,
+                    if parents != 1 {
+                        "is a merge"
+                    } else {
+                        "is on a separate branch"
+                    }
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The tree of `commit`, if the commit is in the local repository.
+    pub fn tree_if_present(&self, commit: Oid) -> Option<Oid> {
+        // Objects fetched since the repository was opened may be in a new pack.
+        if let Ok(odb) = self.git_repo.odb() {
+            let _ = odb.refresh();
+        }
+        self.git_repo.find_commit(commit).ok().map(|c| c.tree_id())
+    }
+
+    /// Map each commit to its change ID with one jj invocation.
+    pub fn change_ids_for(
+        &self,
+        commits: &[PreparedCommit],
+    ) -> Result<std::collections::HashMap<Oid, String>> {
+        if commits.is_empty() {
+            return Ok(Default::default());
+        }
+        let revset = commits
+            .iter()
+            .map(|c| c.oid.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let listing = self.run([
+            "log",
+            "--no-graph",
+            "-r",
+            &revset,
+            "-T",
+            "commit_id ++ \" \" ++ change_id ++ \"\\n\"",
+        ])?;
+        Ok(listing
+            .lines()
+            .filter_map(|line| {
+                let (commit, change) = line.split_once(' ')?;
+                Some((Oid::from_str(commit).ok()?, change.trim().to_string()))
+            })
+            .collect())
+    }
+
     /// Run jj in the workspace and return its standard output. Its standard
     /// error (progress and notices) goes to the terminal.
     pub fn run<I, S>(&self, args: I) -> Result<String>
