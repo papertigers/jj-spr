@@ -100,7 +100,7 @@ impl Jujutsu {
     ) -> Result<Vec<PreparedCommit>> {
         // Get commit range using jj
         let operator = if is_inclusive { "::" } else { ".." };
-        let output = self.run_captured_with_args([
+        let output = self.run([
             "log",
             "--no-graph",
             "-r",
@@ -126,7 +126,7 @@ impl Jujutsu {
     }
 
     pub fn check_no_uncommitted_changes(&self) -> Result<()> {
-        let output = self.run_captured_with_args(["status"])?;
+        let output = self.run(["status"])?;
 
         // Check if there are any changes
         // Jujutsu reports "The working copy has no changes" when clean
@@ -316,7 +316,7 @@ impl Jujutsu {
     }
 
     fn resolve_revision_to_commit_id(&self, revision: &str) -> Result<Oid> {
-        let output = self.run_captured_with_args([
+        let output = self.run([
             "log",
             "--no-graph",
             "-r",
@@ -336,7 +336,7 @@ impl Jujutsu {
 
     fn get_change_id_for_commit(&self, commit_oid: Oid) -> Result<String> {
         // Get the change ID for a given commit OID
-        let output = self.run_captured_with_args([
+        let output = self.run([
             "log",
             "--no-graph",
             "-r",
@@ -348,7 +348,25 @@ impl Jujutsu {
         Ok(output.trim().to_string())
     }
 
-    fn run_captured_with_args<I, S>(&self, args: I) -> Result<String>
+    /// The conflicted changes in `revset`, one per line as
+    /// `<short change ID> <title>`, for reporting. Empty when there are none.
+    pub fn conflicted_changes(&self, revset: &str) -> Result<String> {
+        Ok(self
+            .run([
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("conflicts() & ({revset})"),
+                "-T",
+                "change_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
+            ])?
+            .trim_end()
+            .to_string())
+    }
+
+    /// Run jj in the workspace and return its standard output. Its standard
+    /// error (progress and notices) goes to the terminal.
+    pub fn run<I, S>(&self, args: I) -> Result<String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -378,6 +396,11 @@ impl Jujutsu {
             )))
         }
     }
+}
+
+/// The first eight characters of a change ID, for messages.
+pub fn short(change_id: &str) -> &str {
+    &change_id[..change_id.len().min(8)]
 }
 
 fn get_jj_bin() -> PathBuf {

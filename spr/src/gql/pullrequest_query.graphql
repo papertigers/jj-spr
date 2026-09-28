@@ -8,6 +8,8 @@ query PullRequestQuery($name: String!, $owner: String!, $number: Int!) {
       body
       baseRefName
       headRefName
+      headRefOid
+      isDraft
       mergeCommit {
         oid
       }

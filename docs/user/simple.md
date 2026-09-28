@@ -100,23 +100,15 @@ In this example:
 
    > **Note:** By default, `land` operates on `@` (your working copy). Since your PR change is at `@-`, you must specify `-r @-`.
 
-8. **🚨 CRITICAL: After landing, you MUST manually rebase your working copy:**
+8. **After landing, sync your local state:**
    ```shell
-   jj git fetch
-   jj rebase -r @ -d main@origin
+   jj spr sync
    ```
 
-   > ⚠️ **IMPORTANT - DO NOT SKIP THIS STEP:** jj-spr currently requires manual rebasing after **every** `jj spr land`. The `land` command merges your PR on GitHub but does **not** automatically update your local Jujutsu state.
-   >
-   > **What happens if you skip this:**
-   > - Your working copy will still be based on old `main`
-   > - Future changes will be based on outdated code
-   > - You'll face conflicts and confusion later
-   > - Your stack will be out of sync with GitHub
-   >
-   > **This is a known limitation** that may be automated in future versions. For now, always run the rebase commands immediately after landing.
-   >
-   > **Pro tip:** Create a shell alias (see [Troubleshooting](#troubleshooting)) to combine landing and rebasing into one command.
+   > `land` merges your PR on GitHub but does not change your local
+   > repository. `jj spr sync` fetches, abandons the landed change, and rebases
+   > anything left (including your working copy) onto `main@origin`. It refuses
+   > to abandon a change that has local edits which were not in the merged PR.
 
 ## Working with Change IDs
 
@@ -246,9 +238,16 @@ jj rebase -r @ -d main@origin
 
 ### "I forgot to rebase after landing"
 
-**Problem:** After `jj spr land`, you must manually rebase your working copy onto the updated `main@origin`.
+**Problem:** After `jj spr land`, your working copy is still based on the old `main`.
 
 **Solution:**
+```shell
+jj spr sync
+```
+
+If `sync` refuses because a landed change has local edits, move the edits you
+want to keep into another change (for example with `jj split`), or abandon the
+change, and run it again. To rebase by hand instead:
 ```shell
 jj git fetch
 jj rebase -r @ -d main@origin
