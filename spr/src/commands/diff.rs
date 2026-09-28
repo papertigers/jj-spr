@@ -74,6 +74,12 @@ pub struct DiffOptions {
     /// `spr.nativeStacks` is set.
     #[clap(long, conflicts_with = "native_stack")]
     no_native_stack: bool,
+
+    /// Push even if a Pull Request has commits that are not in its local
+    /// change (someone else pushed to it). Their edits stay in the branch
+    /// history but disappear from the Pull Request's diff.
+    #[clap(long)]
+    discard_remote_changes: bool,
 }
 
 /// The Pull Request branch of a change's parent, which a natively stacked
@@ -184,6 +190,53 @@ pub async fn diff(
     let pull_requests = gh
         .get_pull_requests(prepared_commits.iter().map(|pc| pc.pull_request_number))
         .await?;
+
+    // Everything below compares against the Pull Requests' heads as fetched;
+    // stop if one could not be fetched as GitHub reports it.
+    for pr in pull_requests.iter().flatten() {
+        if let Some(github_head) = pr.github_head_oid
+            && pr.state == PullRequestState::Open
+            && github_head != pr.head_oid
+        {
+            return Err(Error::new(format!(
+                "Could not fetch the current head of Pull Request #{} (GitHub reports {}, \
+                 the local copy of {} is {}). Run `jj git fetch` and try again.",
+                pr.number,
+                github_head,
+                pr.head.branch_name(),
+                pr.head_oid
+            )));
+        }
+    }
+
+    // Pushing replaces a Pull Request's content with the local change's, so
+    // stop before changing anything if that would drop someone else's work.
+    if !opts.discard_remote_changes {
+        let mut changed_remotely = Vec::new();
+        for (commit, pull_request) in zip(prepared_commits.iter(), pull_requests.iter()) {
+            if let Some(pr) = pull_request
+                && pr.state == PullRequestState::Open
+                && !wants_cherry_pick(&opts, &commit.message)
+                && jj.pr_has_remote_changes(config, commit, pr)?
+            {
+                changed_remotely.push(pr.number);
+            }
+        }
+        if let Some(first) = changed_remotely.first() {
+            let (has, s, them) = if changed_remotely.len() == 1 {
+                ("has", "", "it")
+            } else {
+                ("have", "s", "them")
+            };
+            return Err(Error::new(format!(
+                "{} {has} commits that are not in the local change{s} (someone else \
+                 pushed to {them}). Run `jj spr patch {first}` to update your local \
+                 changes from GitHub, or pass --discard-remote-changes to replace \
+                 them with your version.",
+                crate::stacks::format_pr_list(&changed_remotely),
+            )));
+        }
+    }
 
     // With native stacks, GitHub refuses to change the base of a Pull Request
     // that is part of a stack. Work out up front which stacks this run is
@@ -1309,6 +1362,7 @@ mod tests {
             dry_run: false,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         assert!(!opts.all);
@@ -1333,6 +1387,7 @@ mod tests {
             dry_run: false,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         assert_eq!(opts.base, Some("main".to_string()));
@@ -1362,6 +1417,7 @@ mod tests {
             dry_run: false,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         assert_eq!(opts_with_base.base.as_deref(), Some("main"));
@@ -1379,6 +1435,7 @@ mod tests {
             dry_run: false,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         assert_eq!(opts_with_trunk.base.as_deref(), Some("trunk()"));
@@ -1398,6 +1455,7 @@ mod tests {
             dry_run: false,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         // When --all is specified, it should work with base revisions
@@ -1420,6 +1478,7 @@ mod tests {
             dry_run: false,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         assert!(opts.all);
@@ -1444,6 +1503,7 @@ mod tests {
             dry_run: true,
             native_stack: false,
             no_native_stack: false,
+            discard_remote_changes: false,
         };
 
         assert!(opts.dry_run);

@@ -89,7 +89,7 @@ fn test_subcommands_have_help() {
         ("amend", "commit message"),
         ("close", "Pull request"),
         ("list", "Pull Requests"),
-        ("patch", "branch"),
+        ("patch", "Pull Request"),
         ("init", "assistant"),
     ];
 
