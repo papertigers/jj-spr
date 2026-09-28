@@ -331,6 +331,29 @@ impl TestEnv {
         self.git_in(&self.seed, &["push", "-q", "origin", "main"]);
     }
 
+    /// Commit a file on a Pull Request's branch from another clone and push
+    /// it, as a colleague would. Returns the branch's new head.
+    pub fn push_to_pr_branch(&self, number: u64, path: &str, content: &str) -> String {
+        let branch = self.pr(number).head_ref;
+        self.git_in(&self.seed, &["fetch", "-q", "origin", &branch]);
+        self.git_in(
+            &self.seed,
+            &["checkout", "-q", "-B", "colleague", "FETCH_HEAD"],
+        );
+        std::fs::write(self.seed.join(path), content).unwrap();
+        self.git_in(&self.seed, &["add", path]);
+        self.git_in(
+            &self.seed,
+            &["commit", "-q", "-m", &format!("Change {path}")],
+        );
+        self.git_in(
+            &self.seed,
+            &["push", "-q", "origin", &format!("HEAD:{branch}")],
+        );
+        self.git_in(&self.seed, &["checkout", "-q", "main"]);
+        self.head_of(number)
+    }
+
     /// Every PR targets the one below, shows only its own files, has the local
     /// change's tree, and the PRs form one active stack.
     pub fn check_chain(&self, changes: &[String]) -> Vec<u64> {

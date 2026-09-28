@@ -382,6 +382,102 @@ impl Jujutsu {
         self.git_repo.find_commit(commit).ok().map(|c| c.tree_id())
     }
 
+    /// Whether `tree` already contains the changes from `from` to `to` (all
+    /// trees): applying them to `tree` with a three-way merge changes nothing
+    /// and does not conflict. Unlike comparing trees, this still holds when
+    /// `tree` also has other changes, such as a newer main branch.
+    pub fn tree_contains_diff(&self, tree: Oid, from: Oid, to: Oid) -> Result<bool> {
+        Ok(self.merge_trees(from, tree, to)? == Some(tree))
+    }
+
+    /// Where a Pull Request branched off its base.
+    pub fn fork_point(&self, config: &Config, pr: &crate::github::PullRequest) -> Result<Oid> {
+        let base = if pr.base_oid.is_zero() {
+            self.resolve_reference(config.master_ref.local())?
+        } else {
+            pr.base_oid
+        };
+        Ok(self.git_repo.merge_base(pr.head_oid, base)?)
+    }
+
+    /// Whether the Pull Request has edits that its local change lacks, so
+    /// that pushing the local change would drop them.
+    ///
+    /// Edits made locally since the last push must not count, so this is not
+    /// a plain comparison. The Pull Request is fine if the local change
+    /// contains its diff, or if its diff is that of a version of the local
+    /// change from `jj evolog` (the one last pushed; after a stacked merge
+    /// GitHub rebases that onto a new base, so the trees can differ).
+    pub fn pr_has_remote_changes(
+        &self,
+        config: &Config,
+        local: &PreparedCommit,
+        pr: &crate::github::PullRequest,
+    ) -> Result<bool> {
+        let Some(head_tree) = (!pr.head_oid.is_zero())
+            .then(|| self.tree_if_present(pr.head_oid))
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        let fork_tree = self.get_tree_oid_for_commit(self.fork_point(config, pr)?)?;
+
+        let local_tree = self.get_tree_oid_for_commit(local.oid)?;
+        if self.tree_contains_diff(local_tree, fork_tree, head_tree)? {
+            return Ok(false);
+        }
+        for version in self.evolog(local.oid)? {
+            let commit = self.git_repo.find_commit(version)?;
+            let tree = commit.tree_id();
+            if tree == head_tree {
+                return Ok(false);
+            }
+            let Ok(parent) = commit.parent(0) else {
+                continue;
+            };
+            if self.tree_contains_diff(head_tree, parent.tree_id(), tree)?
+                && self.tree_contains_diff(tree, fork_tree, head_tree)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The conflicted changes in `revset`, one per line as
+    /// `<short change ID> <title>`, for reporting. Empty when there are none.
+    pub fn conflicted_changes(&self, revset: &str) -> Result<String> {
+        Ok(self
+            .run([
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("conflicts() & ({revset})"),
+                "-T",
+                "change_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
+            ])?
+            .trim_end()
+            .to_string())
+    }
+
+    /// Every version of the change that `commit` is, newest first, from
+    /// `jj evolog`, leaving out any that are not in the Git repository.
+    pub fn evolog(&self, commit: Oid) -> Result<Vec<Oid>> {
+        let listing = self.run([
+            "evolog",
+            "--no-graph",
+            "-r",
+            &commit.to_string(),
+            "-T",
+            "commit.commit_id() ++ \"\\n\"",
+        ])?;
+        Ok(listing
+            .lines()
+            .filter_map(|line| Oid::from_str(line.trim()).ok())
+            .filter(|oid| self.tree_if_present(*oid).is_some())
+            .collect())
+    }
+
     /// Map each commit to its change ID with one jj invocation.
     pub fn change_ids_for(
         &self,
@@ -410,22 +506,6 @@ impl Jujutsu {
                 Some((Oid::from_str(commit).ok()?, change.trim().to_string()))
             })
             .collect())
-    }
-
-    /// The conflicted changes in `revset`, one per line as
-    /// `<short change ID> <title>`, for reporting. Empty when there are none.
-    pub fn conflicted_changes(&self, revset: &str) -> Result<String> {
-        Ok(self
-            .run([
-                "log",
-                "--no-graph",
-                "-r",
-                &format!("conflicts() & ({revset})"),
-                "-T",
-                "change_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
-            ])?
-            .trim_end()
-            .to_string())
     }
 
     /// Run jj in the workspace and return its standard output. Its standard
