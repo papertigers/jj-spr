@@ -17,7 +17,17 @@ pub struct Config {
     pub master_ref: GitHubBranch,
     pub branch_prefix: String,
     pub require_approval: bool,
+    /// Base URL of the GitHub REST API (`https://api.github.com` unless
+    /// configured otherwise with `spr.githubApiUrl`). The GraphQL endpoint is
+    /// `<github_api_url>/graphql`.
+    pub github_api_url: String,
+    /// Whether dependent Pull Requests are published as a native GitHub stack
+    /// (`spr.nativeStacks`): each PR targets the PR branch of its parent
+    /// change, and the chain is registered with GitHub's Stacks API.
+    pub native_stacks: bool,
 }
+
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 
 impl Config {
     pub fn new(
@@ -37,7 +47,40 @@ impl Config {
             master_ref,
             branch_prefix,
             require_approval,
+            github_api_url: DEFAULT_GITHUB_API_URL.to_string(),
+            native_stacks: false,
         }
+    }
+
+    pub fn with_github_api_url(mut self, url: impl Into<String>) -> Self {
+        self.github_api_url = url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    pub fn with_native_stacks(mut self, native_stacks: bool) -> Self {
+        self.native_stacks = native_stacks;
+        self
+    }
+
+    /// The revset of the main branch as jj sees it, e.g. `main@origin`.
+    pub fn trunk_revset(&self) -> String {
+        format!("{}@{}", self.master_ref.branch_name(), self.remote_name)
+    }
+
+    /// Resolve the `--native-stack`/`--no-native-stack` flag pair against
+    /// the `spr.nativeStacks` setting.
+    pub fn native_stacks_with(&self, native_stack: bool, no_native_stack: bool) -> bool {
+        if native_stack {
+            true
+        } else if no_native_stack {
+            false
+        } else {
+            self.native_stacks
+        }
+    }
+
+    pub fn graphql_url(&self) -> String {
+        format!("{}/graphql", self.github_api_url)
     }
 
     pub fn pull_request_url(&self, number: u64) -> String {

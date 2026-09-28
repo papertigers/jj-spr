@@ -37,7 +37,7 @@ pub struct PullRequest {
     pub head_oid: git2::Oid,
     pub merge_commit: Option<git2::Oid>,
     pub reviewers: HashMap<String, ReviewStatus>,
-    pub review_status: Option<ReviewStatus>,
+    pub review_decision: ReviewDecision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,18 @@ pub enum ReviewStatus {
     Requested,
     Approved,
     Rejected,
+}
+
+/// GitHub's overall review decision for a Pull Request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    /// The repository requires a review, and there is no approval yet.
+    Required,
+    /// No review required, and none given.
+    #[default]
+    None,
 }
 
 #[derive(serde::Serialize, Default, Debug)]
@@ -87,6 +99,7 @@ pub struct PullRequestRequestReviewers {
 #[serde(rename_all = "lowercase")]
 pub enum PullRequestState {
     Open,
+    Merged,
     Closed,
 }
 
@@ -162,13 +175,8 @@ impl GitHub {
             .map_err(Error::from)
     }
 
-    pub async fn get_pull_request(self, number: u64) -> Result<PullRequest> {
-        let GitHub {
-            config,
-            repo_path,
-            graphql_client,
-        } = self;
-        let repo_path = repo_path.to_str().unwrap();
+    pub async fn get_pull_request(&self, number: u64) -> Result<PullRequest> {
+        let config = &self.config;
 
         let variables = pull_request_query::Variables {
             name: config.repo.clone(),
@@ -176,18 +184,16 @@ impl GitHub {
             number: number as i64,
         };
         let request_body = PullRequestQuery::build_query(variables);
-        let res = graphql_client
-            .post("https://api.github.com/graphql")
+        let res = self
+            .graphql_client
+            .post(config.graphql_url())
             .json(&request_body)
             .send()
             .await?;
         let response_body: Response<pull_request_query::ResponseData> = res.json().await?;
 
         if let Some(errors) = response_body.errors {
-            let error = Err(Error::new(format!("fetching PR #{number} failed")));
-            return errors
-                .into_iter()
-                .fold(error, |err, e| err.context(e.to_string()));
+            return Err(graphql_error(errors, &format!("fetching PR #{number}")));
         }
 
         let pr = response_body
@@ -205,7 +211,7 @@ impl GitHub {
         let _fetch_result = tokio::process::Command::new("git")
             .args([
                 "--git-dir",
-                repo_path,
+                self.repo_path.to_str().unwrap(),
                 "fetch",
                 "--no-write-fetch-head",
                 &config.remote_name,
@@ -215,36 +221,13 @@ impl GitHub {
             .output()
             .await;
 
-        // Convert branch refs to OIDs
-        let base_oid = if let Ok(output) = tokio::process::Command::new("git")
-            .args(["--git-dir", repo_path, "rev-parse", base.local()])
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
-            } else {
-                git2::Oid::zero()
-            }
-        } else {
-            git2::Oid::zero()
+        let repo = git2::Repository::open(&self.repo_path)?;
+        let rev_parse = |reference: &str| {
+            repo.refname_to_id(reference)
+                .unwrap_or_else(|_| git2::Oid::zero())
         };
-
-        let head_oid = if let Ok(output) = tokio::process::Command::new("git")
-            .args(["--git-dir", repo_path, "rev-parse", head.local()])
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
-            } else {
-                git2::Oid::zero()
-            }
-        } else {
-            git2::Oid::zero()
-        };
+        let base_oid = rev_parse(base.local());
+        let head_oid = rev_parse(head.local());
 
         let mut sections = parse_message(&pr.body, MessageSection::Summary);
 
@@ -279,17 +262,17 @@ impl GitHub {
             })
             .collect();
 
-        let review_status = match pr.review_decision {
+        let review_decision = match pr.review_decision {
             Some(pull_request_query::PullRequestReviewDecision::APPROVED) => {
-                Some(ReviewStatus::Approved)
+                ReviewDecision::Approved
             }
             Some(pull_request_query::PullRequestReviewDecision::CHANGES_REQUESTED) => {
-                Some(ReviewStatus::Rejected)
+                ReviewDecision::ChangesRequested
             }
             Some(pull_request_query::PullRequestReviewDecision::REVIEW_REQUIRED) => {
-                Some(ReviewStatus::Requested)
+                ReviewDecision::Required
             }
-            _ => None,
+            _ => ReviewDecision::None,
         };
 
         let requested_reviewers: Vec<String> = pr.review_requests
@@ -322,7 +305,7 @@ impl GitHub {
             }),
         );
 
-        if review_status == Some(ReviewStatus::Approved) {
+        if review_decision == ReviewDecision::Approved {
             sections.insert(
                 MessageSection::ReviewedBy,
                 reviewers
@@ -348,6 +331,7 @@ impl GitHub {
             number: pr.number as u64,
             state: match pr.state {
                 pull_request_query::PullRequestState::OPEN => PullRequestState::Open,
+                pull_request_query::PullRequestState::MERGED => PullRequestState::Merged,
                 _ => PullRequestState::Closed,
             },
             title: pr.title,
@@ -358,11 +342,26 @@ impl GitHub {
             base_oid,
             head_oid,
             reviewers,
-            review_status,
+            review_decision,
             merge_commit: pr
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
         })
+    }
+
+    /// Fetch several Pull Requests concurrently, preserving order. Entries
+    /// without a number stay `None`.
+    pub async fn get_pull_requests(
+        &self,
+        numbers: impl IntoIterator<Item = Option<u64>>,
+    ) -> Result<Vec<Option<PullRequest>>> {
+        futures::future::try_join_all(numbers.into_iter().map(|number| async move {
+            match number {
+                Some(number) => Ok(Some(self.get_pull_request(number).await?)),
+                None => Ok(None),
+            }
+        }))
+        .await
     }
 
     pub async fn create_pull_request(
@@ -436,7 +435,7 @@ impl GitHub {
         let request_body = PullRequestMergeabilityQuery::build_query(variables);
         let res = self
             .graphql_client
-            .post("https://api.github.com/graphql")
+            .post(self.config.graphql_url())
             .json(&request_body)
             .send()
             .await?;
@@ -444,12 +443,10 @@ impl GitHub {
             res.json().await?;
 
         if let Some(errors) = response_body.errors {
-            let error = Err(Error::new(format!(
-                "querying PR #{number} mergeability failed"
-            )));
-            return errors
-                .into_iter()
-                .fold(error, |err, e| err.context(e.to_string()));
+            return Err(graphql_error(
+                errors,
+                &format!("querying PR #{number} mergeability"),
+            ));
         }
 
         let pr = response_body
@@ -475,8 +472,10 @@ impl GitHub {
         })
     }
 
-    pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {
-        let mut branch_names = HashSet::new();
+    /// All open Pull Requests in the repository, with their head and base
+    /// branch names.
+    pub async fn get_open_pull_requests(&self) -> Result<Vec<OpenPullRequest>> {
+        let mut pull_requests = Vec::new();
         let mut after: Option<String> = None;
 
         loop {
@@ -489,7 +488,7 @@ impl GitHub {
             let request_body = OpenPullRequestBranchesQuery::build_query(variables);
             let res = self
                 .graphql_client
-                .post("https://api.github.com/graphql")
+                .post(self.config.graphql_url())
                 .json(&request_body)
                 .send()
                 .await?;
@@ -512,8 +511,11 @@ impl GitHub {
 
             if let Some(nodes) = prs.nodes {
                 for node in nodes.into_iter().flatten() {
-                    branch_names.insert(node.head_ref_name);
-                    branch_names.insert(node.base_ref_name);
+                    pull_requests.push(OpenPullRequest {
+                        number: node.number as u64,
+                        head_ref_name: node.head_ref_name,
+                        base_ref_name: node.base_ref_name,
+                    });
                 }
             }
 
@@ -524,8 +526,305 @@ impl GitHub {
             }
         }
 
-        Ok(branch_names)
+        Ok(pull_requests)
     }
+
+    pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .get_open_pull_requests()
+            .await?
+            .into_iter()
+            .flat_map(|pr| [pr.head_ref_name, pr.base_ref_name])
+            .collect())
+    }
+
+    /// Send a request to the GitHub REST API, using the API version that
+    /// introduced stacked pull requests.
+    async fn rest_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<(reqwest::StatusCode, Option<serde_json::Value>)> {
+        let url = format!("{}{}", self.config.github_api_url, path);
+        let mut request = self
+            .graphql_client
+            .request(method.clone(), &url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_STACKS_API_VERSION);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        let json = if text.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str(&text).ok()
+        };
+
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok((status, json));
+        }
+
+        let github_message = json
+            .as_ref()
+            .and_then(|v| v.get("message"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or(text);
+        Err(Error::new(format!(
+            "GitHub returned {} for {} {}: {}",
+            status.as_u16(),
+            method,
+            path,
+            github_message
+        )))
+    }
+
+    fn stacks_path(&self) -> String {
+        format!("/repos/{}/{}/stacks", self.config.owner, self.config.repo)
+    }
+
+    /// List the repository's native GitHub stacks. Returns `None` when stacked
+    /// pull requests are not enabled for the repository (GitHub answers 404).
+    pub async fn list_stacks(&self) -> Result<Option<Vec<GitHubStack>>> {
+        let mut stacks = Vec::new();
+        let mut page = 1;
+        loop {
+            let (status, json) = self
+                .rest_request(
+                    reqwest::Method::GET,
+                    &format!("{}?per_page=100&page={}", self.stacks_path(), page),
+                    None,
+                )
+                .await?;
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            let batch: Vec<GitHubStack> = serde_json::from_value(json.unwrap_or_default())
+                .map_err(|e| Error::new(format!("GitHub returned an invalid stack list: {e}")))?;
+            let full_page = batch.len() == 100;
+            stacks.extend(batch);
+            if !full_page {
+                break;
+            }
+            page += 1;
+        }
+        Ok(Some(stacks))
+    }
+
+    /// The stack that contains Pull Request `number`, if any. `None` also
+    /// when stacked pull requests are not enabled for the repository.
+    pub async fn stack_containing(&self, number: u64) -> Result<Option<GitHubStack>> {
+        Ok(self
+            .list_stacks()
+            .await?
+            .into_iter()
+            .flatten()
+            .find(|stack| stack.active_pull_requests().contains(&number)))
+    }
+
+    /// Create a native GitHub stack from Pull Request numbers, bottom first.
+    pub async fn create_stack(&self, pull_requests: &[u64]) -> Result<GitHubStack> {
+        let (status, json) = self
+            .rest_request(
+                reqwest::Method::POST,
+                &self.stacks_path(),
+                Some(serde_json::json!({ "pull_requests": pull_requests })),
+            )
+            .await?;
+        parse_stack_response(status, json, "creating a stack")
+    }
+
+    /// Append Pull Requests (bottom first) to the top of an existing stack.
+    pub async fn add_to_stack(&self, stack: u64, pull_requests: &[u64]) -> Result<GitHubStack> {
+        let (status, json) = self
+            .rest_request(
+                reqwest::Method::POST,
+                &format!("{}/{}/add", self.stacks_path(), stack),
+                Some(serde_json::json!({ "pull_requests": pull_requests })),
+            )
+            .await?;
+        parse_stack_response(status, json, "adding to a stack")
+    }
+
+    /// Remove the open Pull Requests from a stack. The Pull Requests
+    /// themselves, and their branches, stay as they are.
+    pub async fn unstack(&self, stack: u64) -> Result<()> {
+        let (status, _) = self
+            .rest_request(
+                reqwest::Method::POST,
+                &format!("{}/{}/unstack", self.stacks_path(), stack),
+                None,
+            )
+            .await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::new(format!("GitHub stack #{stack} was not found")));
+        }
+        Ok(())
+    }
+
+    /// Merge a Pull Request that is part of a native stack. GitHub only
+    /// accepts merges of stacked Pull Requests through its asynchronous merge
+    /// endpoint; this submits the merge and waits for it to finish.
+    pub async fn merge_stacked_pull_request(
+        &self,
+        number: u64,
+        expected_head: git2::Oid,
+        merge_method: &str,
+    ) -> Result<Option<String>> {
+        let path = format!(
+            "/repos/{}/{}/pulls/{}/merge-async",
+            self.config.owner, self.config.repo, number
+        );
+        let (status, json) = self
+            .rest_request(
+                reqwest::Method::PUT,
+                &path,
+                Some(serde_json::json!({
+                    "merge_action": "direct_merge",
+                    "merge_method": merge_method,
+                    "sha": expected_head.to_string(),
+                })),
+            )
+            .await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::new(format!(
+                "GitHub could not find Pull Request #{number} to merge"
+            )));
+        }
+        let mut merge: StackMerge = serde_json::from_value(json.unwrap_or_default())
+            .map_err(|e| Error::new(format!("GitHub returned an invalid merge response: {e}")))?;
+
+        for _ in 0..120 {
+            match merge.status.as_str() {
+                "merged" => return Ok(merge.details.sha),
+                "failed" => {
+                    return Err(Error::new(format!(
+                        "GitHub could not merge Pull Request #{number}: {}",
+                        merge.details.message.unwrap_or_default()
+                    )));
+                }
+                "enqueued" => {
+                    return Err(Error::new(format!(
+                        "GitHub added Pull Request #{number} to the merge queue instead \
+                         of merging it: {}",
+                        merge.details.message.unwrap_or_default()
+                    )));
+                }
+                _ => {}
+            }
+            let uuid = merge.details.uuid.clone().ok_or_else(|| {
+                Error::new("GitHub's merge response did not identify the merge operation")
+            })?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let (_, json) = self
+                .rest_request(reqwest::Method::GET, &format!("{path}/{uuid}"), None)
+                .await?;
+            merge = serde_json::from_value(json.unwrap_or_default()).map_err(|e| {
+                Error::new(format!("GitHub returned an invalid merge response: {e}"))
+            })?;
+        }
+        Err(Error::new(format!(
+            "Timed out waiting for GitHub to merge Pull Request #{number}"
+        )))
+    }
+}
+
+/// `X-GitHub-Api-Version` for the Stacks API and the asynchronous merge
+/// endpoint.
+pub const GITHUB_STACKS_API_VERSION: &str = "2026-03-10";
+
+/// One error for a failed GraphQL request, with GitHub's messages attached.
+fn graphql_error(errors: Vec<graphql_client::Error>, what: &str) -> Error {
+    errors
+        .into_iter()
+        .fold(Error::new(format!("{what} failed")), |mut err, e| {
+            err.push(e.to_string());
+            err
+        })
+}
+
+fn parse_stack_response(
+    status: reqwest::StatusCode,
+    json: Option<serde_json::Value>,
+    what: &str,
+) -> Result<GitHubStack> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(Error::new(format!(
+            "GitHub answered 404 while {what}; stacked pull requests may not be \
+             enabled for this repository"
+        )));
+    }
+    serde_json::from_value(json.unwrap_or_default()).map_err(|e| {
+        Error::new(format!(
+            "GitHub returned an invalid stack while {what}: {e}"
+        ))
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenPullRequest {
+    pub number: u64,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+}
+
+/// A native GitHub stack, as returned by the Stacks API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubStack {
+    pub number: u64,
+    pub pull_requests: Vec<GitHubStackMember>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubStackMember {
+    pub number: u64,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub merged_at: Option<String>,
+}
+
+impl GitHubStackMember {
+    /// Merged and closed members stay listed in a stack as history.
+    pub fn is_active(&self) -> bool {
+        self.merged_at.is_none() && self.state.as_deref().unwrap_or("open") == "open"
+    }
+}
+
+impl GitHubStack {
+    /// The open members of the stack, bottom first.
+    pub fn active_pull_requests(&self) -> Vec<u64> {
+        self.pull_requests
+            .iter()
+            .filter(|pr| pr.is_active())
+            .map(|pr| pr.number)
+            .collect()
+    }
+
+    pub fn contains(&self, number: u64) -> bool {
+        self.pull_requests.iter().any(|pr| pr.number == number)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StackMerge {
+    status: String,
+    #[serde(default)]
+    details: StackMergeDetails,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StackMergeDetails {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -60,6 +60,11 @@ pub async fn close(
         return result;
     }
 
+    let selection: Vec<u64> = prepared_commits
+        .iter()
+        .filter_map(|pc| pc.pull_request_number)
+        .collect();
+
     for prepared_commit in prepared_commits.iter_mut() {
         if result.is_err() {
             break;
@@ -71,7 +76,7 @@ pub async fn close(
         // This makes it easier to run the code to update the local commit message
         // with all the changes that the implementation makes at the end, even if
         // the implementation encounters an error or exits early.
-        result = close_impl(jj, gh, config, prepared_commit).await;
+        result = close_impl(jj, gh, config, prepared_commit, &selection).await;
     }
 
     // This updates the commit message in the local Jujutsu repository (if it was
@@ -89,6 +94,7 @@ async fn close_impl(
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
     prepared_commit: &mut PreparedCommit,
+    selection: &[u64],
 ) -> Result<()> {
     let pull_request_number = if let Some(number) = prepared_commit.pull_request_number {
         output("#️⃣ ", &format!("Pull Request #{}", number))?;
@@ -136,19 +142,52 @@ async fn close_impl(
     prepared_commit.message.remove(&MessageSection::ReviewedBy);
     prepared_commit.message_changed = true;
 
-    let mut remove_old_branch_child_process = jj
-        .git_command()
-        .arg("push")
-        .arg("--no-verify")
-        .arg("--delete")
-        .arg("--")
-        .arg(&config.remote_name)
-        .arg(pull_request.head.on_github())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    // Keep branches that other open Pull Requests still use: GitHub closes a
+    // Pull Request whose base branch is deleted, and a natively stacked Pull
+    // Request's base is another Pull Request's branch.
+    let open_pull_requests = gh.get_open_pull_requests().await?;
+    let dependents: Vec<u64> = open_pull_requests
+        .iter()
+        .filter(|pr| {
+            pr.number != pull_request_number
+                && !selection.contains(&pr.number)
+                && pr.base_ref_name == pull_request.head.branch_name()
+        })
+        .map(|pr| pr.number)
+        .collect();
+    let base_used_elsewhere = open_pull_requests.iter().any(|pr| {
+        pr.number != pull_request_number
+            && (pr.head_ref_name == pull_request.base.branch_name()
+                || pr.base_ref_name == pull_request.base.branch_name())
+    });
 
-    let remove_old_base_branch_child_process = if base_is_master {
+    let remove_old_branch_child_process = if dependents.is_empty() {
+        Some(
+            jj.git_command()
+                .arg("push")
+                .arg("--no-verify")
+                .arg("--delete")
+                .arg("--")
+                .arg(&config.remote_name)
+                .arg(pull_request.head.on_github())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        )
+    } else {
+        output(
+            "⚠️",
+            &format!(
+                "Keeping branch {} because {} still target it. Rebase those \
+                 changes and run `jj spr diff --all` to restack them.",
+                pull_request.head.branch_name(),
+                crate::stacks::format_pr_list(&dependents),
+            ),
+        )?;
+        None
+    };
+
+    let remove_old_base_branch_child_process = if base_is_master || base_used_elsewhere {
         None
     } else {
         Some(
@@ -169,7 +208,9 @@ async fn close_impl(
     // but ignore the result.
     // GitHub may be configured to delete the branch automatically,
     // in which case it's gone already and this command fails.
-    remove_old_branch_child_process.wait().await?;
+    if let Some(mut proc) = remove_old_branch_child_process {
+        proc.wait().await?;
+    }
     if let Some(mut proc) = remove_old_base_branch_child_process {
         proc.wait().await?;
     }

@@ -177,6 +177,13 @@ pub fn build_github_body_for_merging(section_texts: &MessageSectionsMap) -> Stri
     )
 }
 
+/// Whether the message carries a "Cherry Pick: true" marker.
+pub fn cherry_pick_marked(message: &MessageSectionsMap) -> bool {
+    message
+        .get(&MessageSection::CherryPick)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
 pub fn validate_commit_message(message: &MessageSectionsMap) -> Result<()> {
     let title_missing_or_empty = match message.get(&MessageSection::Title) {
         None => true,
@@ -194,6 +201,22 @@ pub fn validate_commit_message(message: &MessageSectionsMap) -> Result<()> {
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
+
+    #[test]
+    fn test_cherry_pick_marker() {
+        let map_with = |value: &str| -> MessageSectionsMap {
+            [(MessageSection::CherryPick, value.to_string())].into()
+        };
+        assert!(!cherry_pick_marked(&MessageSectionsMap::new()));
+        assert!(cherry_pick_marked(&map_with("true")));
+        assert!(cherry_pick_marked(&map_with("TRUE")));
+        for value in ["false", "yes", "1", ""] {
+            assert!(
+                !cherry_pick_marked(&map_with(value)),
+                "expected false for marker value {value:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_empty() {
