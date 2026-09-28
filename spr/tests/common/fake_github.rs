@@ -493,6 +493,38 @@ impl State {
         op.sha = Some(sha);
     }
 
+    /// Merge a Pull Request the way someone would in GitHub's web UI: a
+    /// stacked PR merges its stack prefix and GitHub rebases the rest; any
+    /// other PR is squash-merged into its base.
+    pub fn merge_on_github(&mut self, number: u64) {
+        if self.stack_of(number).is_some() {
+            let head_ref = self.prs[&number].head_ref.clone();
+            let head = self.branches()[&head_ref].clone();
+            self.merge_ops.insert(
+                number,
+                MergeOperation {
+                    uuid: format!("merge-{}", self.merge_ops.len() + 1),
+                    pr_number: number,
+                    method: "squash".into(),
+                    expected_head: head,
+                    status: "pending".into(),
+                    message: "Merge request enqueued.".into(),
+                    sha: None,
+                },
+            );
+            self.complete_stack_merge(number);
+        } else {
+            self.squash_merge(number);
+        }
+    }
+
+    /// Close a Pull Request without merging it, as in GitHub's web UI.
+    pub fn close_on_github(&mut self, number: u64) {
+        let pr = self.prs.get_mut(&number).expect("no such pull request");
+        pr.state = "closed".into();
+        pr.closed_reason = Some("closed on GitHub".into());
+    }
+
     fn merge_payload(op: &MergeOperation) -> Value {
         json!({
             "status": op.status,

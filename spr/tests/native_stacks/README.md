@@ -1,5 +1,10 @@
 # Native stack scenarios
 
+> **Historical.** The Rust suites (`tests/native_stacks.rs`, `tests/sync.rs`,
+> with the fake GitHub in `tests/common/`) are the maintained tests and run
+> with `cargo test`. The Python harness in this directory is kept for
+> reference only; it does not cover `jj spr sync` and is not kept up to date.
+
 End-to-end checks of `jj spr diff`, `land` and `close` with
 `spr.nativeStacks`, run against a fake GitHub that serves jj-spr's REST and
 GraphQL calls from a local bare Git repository and models GitHub's stacked

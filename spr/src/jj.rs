@@ -332,6 +332,16 @@ impl Jujutsu {
         Ok(output.trim().to_string())
     }
 
+    /// Run jj in the workspace and return its standard output. Its standard
+    /// error (progress and notices) goes to the terminal.
+    pub fn run<I, S>(&self, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_captured_with_args(args)
+    }
+
     fn run_captured_with_args<I, S>(&self, args: I) -> Result<String>
     where
         I: IntoIterator<Item = S>,

@@ -35,6 +35,11 @@ pub struct PullRequest {
     pub head: GitHubBranch,
     pub base_oid: git2::Oid,
     pub head_oid: git2::Oid,
+    /// The head commit as GitHub reports it. Unlike `head_oid`, which comes
+    /// from the local remote-tracking ref, this is still known after the
+    /// Pull Request's branch has been deleted.
+    pub github_head_oid: Option<git2::Oid>,
+    pub is_draft: bool,
     pub merge_commit: Option<git2::Oid>,
     pub reviewers: HashMap<String, ReviewStatus>,
     pub review_status: Option<ReviewStatus>,
@@ -357,6 +362,8 @@ impl GitHub {
             head,
             base_oid,
             head_oid,
+            github_head_oid: git2::Oid::from_str(&pr.head_ref_oid).ok(),
+            is_draft: pr.is_draft,
             reviewers,
             review_status,
             merge_commit: pr

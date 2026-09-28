@@ -411,11 +411,10 @@ pub async fn land(
                 return Err(Error::new("git fetch failed"));
             }
         }
-        // TODO: Implement Jujutsu-native rebase after landing
-        // For now, the user will need to manually rebase after landing
         output(
-            "⚠️",
-            "Please manually rebase your working copy after landing",
+            "👉",
+            "Run `jj spr sync` to abandon the landed change and rebase the rest \
+             of the stack",
         )?;
     }
 

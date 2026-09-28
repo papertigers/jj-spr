@@ -62,10 +62,9 @@ jj spr land --cherry-pick -r <change-id>
 jj spr land --cherry-pick -r <other-change-id>
 ```
 
-**After landing, you still need to rebase:**
+**After landing, bring your local changes up to date:**
 ```shell
-jj git fetch
-jj rebase -r @ -d main@origin
+jj spr sync
 ```
 
 **Benefits:**
@@ -143,8 +142,8 @@ With native stacks:
   must have been submitted already.
 - `jj spr land` only lands the bottom PR of a stack, and merges it through
   GitHub's stack-aware merge. GitHub then retargets the next PR to the main
-  branch and rebases the rest of the stack. Afterwards, rebase your remaining
-  changes onto the main branch and run `jj spr diff --all`.
+  branch and rebases the rest of the stack. Afterwards, run `jj spr sync` and
+  then `jj spr diff --all`.
 - Existing PRs that use jj-spr base branches are moved over the next time you
   run `jj spr diff --all`; the old base branches can be removed with
   `jj spr cleanup`.
@@ -276,7 +275,7 @@ Alternatively, edit the change directly:
 >
 > 1. **Landing order matters:** Always land changes in order (parent before child). Landing out of order **will** cause merge conflicts and break your stack.
 >
-> 2. **Manual rebasing required:** After **every** `jj spr land`, you must manually rebase both your working copy AND any remaining changes in the stack. This is error-prone and easy to forget.
+> 2. **Sync after landing:** After `jj spr land` (or a merge on GitHub), run `jj spr sync` to abandon the landed change and rebase the rest of the stack. See [Syncing after merges](#syncing-after-merges).
 
 ### Landing Process (Parent Change)
 
@@ -296,22 +295,12 @@ Before landing:
    jj spr land -r rlvkpnrw  # Use the actual change ID
    ```
 
-2. **REQUIRED - Fetch and rebase working copy:**
+2. **Sync the local stack:**
    ```shell
-   jj git fetch
-   jj rebase -r @ -d main@origin
+   jj spr sync  # abandons rlvkpnrw and rebases kmkuslkw onto main@origin
    ```
 
-3. **REQUIRED - Rebase child changes onto new main:**
-   ```shell
-   # Check what needs rebasing
-   jj log -r 'main@origin..'
-
-   # Rebase the child change
-   jj rebase -s kmkuslkw -d main@origin  # kmkuslkw is now based on main
-   ```
-
-4. **REQUIRED - Update remaining PRs:**
+3. **Update remaining PRs:**
    ```shell
    jj spr diff --all  # Updates PR #124 to be based on main instead of PR #123
    ```
@@ -322,7 +311,25 @@ Before landing:
 ◆  main@origin (now includes rlvkpnrw)
 ```
 
-**This is 4 commands just to land ONE change.** If you skip any step, your stack will be broken.
+### Syncing after merges
+
+`jj spr sync` brings a local stack up to date after some of its Pull Requests
+merged, whether with `jj spr land` or on GitHub:
+
+1. It fetches, and looks up the Pull Request of every change between
+   `main@origin` and `@-` (or the revision given with `-r`).
+2. It abandons the changes whose Pull Requests merged. jj moves anything above
+   an abandoned change onto its parent, so this also works when a PR in the
+   middle merged first (for example a cherry-picked one).
+3. It rebases the rest of the stack onto `main@origin`.
+
+It stops before changing anything if a merged change has local edits that were
+not in the merged Pull Request, so unpublished work is never abandoned. It
+never rebases just because `main` moved (use `jj rebase` for that), and it
+reports conflicts left by the rebase instead of submitting them. `--dry-run`
+shows what it would do, and `jj undo` reverts a sync.
+
+Afterwards, run `jj spr diff --all` to update the remaining Pull Requests.
 
 ### Best Practices
 
