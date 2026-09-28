@@ -7,7 +7,6 @@
 
 use crate::{
     error::{Error, Result},
-    jj::PreparedCommit,
     message::validate_commit_message,
     output::{output, write_commit_title},
 };
@@ -55,21 +54,15 @@ pub async fn amend(
 
     // Request the Pull Request information for each commit (well, those that
     // declare to have Pull Requests).
-    let pull_requests: Vec<_> = pc
-        .iter()
-        .map(|commit: &PreparedCommit| {
-            commit
-                .pull_request_number
-                .map(|number| tokio::spawn(gh.clone().get_pull_request(number)))
-        })
-        .collect();
+    let pull_requests = gh
+        .get_pull_requests(pc.iter().map(|commit| commit.pull_request_number))
+        .await?;
 
     let mut failure = false;
 
     for (commit, pull_request) in pc.iter_mut().zip(pull_requests) {
         write_commit_title(commit)?;
         if let Some(pull_request) = pull_request {
-            let pull_request = pull_request.await??;
             commit.message = pull_request.sections;
             commit.message_changed = true;
         }
