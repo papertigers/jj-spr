@@ -3,6 +3,8 @@
 It serves the REST and GraphQL calls jj-spr makes, backed by a bare Git
 repository that jj-spr pushes to, and models GitHub's stacked pull requests.
 
+A Rust port lives in tests/common/fake_github.rs; keep the two in step.
+
 The stack behaviour follows the fake GitHub in jj-stack
 (https://github.com/bos/jj-stack, tests/support/fake_github.py, Apache-2.0),
 whose authors checked it against the real API:
@@ -240,6 +242,7 @@ class FakeGitHub:
             "number": pr.number,
             "state": state,
             "reviewDecision": None,
+            "isDraft": pr.draft,
             "title": pr.title,
             "body": pr.body,
             "baseRefName": pr.base_ref,

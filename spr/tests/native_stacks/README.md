@@ -1,20 +1,36 @@
 # Native stack scenarios
 
 End-to-end checks of `jj spr diff`, `land` and `close` with
-`spr.nativeStacks`, run against a fake GitHub (`fake_github.py`) that serves
-jj-spr's REST and GraphQL calls from a local bare Git repository and models
-GitHub's stacked pull requests. The stack rules follow the fake GitHub in
+`spr.nativeStacks`, run against a fake GitHub that serves jj-spr's REST and
+GraphQL calls from a local bare Git repository and models GitHub's stacked
+pull requests. The stack rules follow the fake GitHub in
 [jj-stack](https://github.com/bos/jj-stack), whose authors checked them against
-the real API; the module docstring lists which behaviours are assumptions.
+the real API; the fake's module documentation lists which behaviours are
+assumptions.
 
-Both files use only the Python standard library (3.9+).
+There are two implementations of the same scenarios, under the same names:
 
-```shell
-cargo build
-python3 spr/tests/native_stacks/run_scenarios.py --jj-spr target/debug/jj-spr
-python3 spr/tests/native_stacks/run_scenarios.py --jj-spr target/debug/jj-spr -k land -v
-```
+- **Rust** (`tests/native_stacks.rs`, with the fake in `tests/common/`) runs
+  as part of `cargo test`:
 
-`-k` selects scenarios by name and `-v` prints every command with its output.
-Each scenario runs in a temporary directory with its own jj config, so your
-own configuration is not used or changed.
+  ```shell
+  cargo test --test native_stacks
+  SPR_TEST_VERBOSE=1 cargo test --test native_stacks land_bottom -- --nocapture
+  ```
+
+- **Python** (this directory) uses only the standard library (3.9+) and runs
+  against any jj-spr binary, which makes it handy for checking a release
+  build or another platform:
+
+  ```shell
+  python3 spr/tests/native_stacks/run_scenarios.py --jj-spr target/release/jj-spr
+  python3 spr/tests/native_stacks/run_scenarios.py --jj-spr target/release/jj-spr -k land -v
+  ```
+
+Both need `jj` and `git` on `PATH`. Each scenario runs in a temporary
+directory with its own jj and Git configuration, so your own configuration is
+not used or changed.
+
+When GitHub's behaviour turns out to differ from the fake, change both fakes
+(`tests/common/fake_github.rs` and `fake_github.py`) and add the scenario to
+both suites.
