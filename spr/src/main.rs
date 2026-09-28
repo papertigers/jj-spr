@@ -76,6 +76,10 @@ enum Commands {
     /// Remove orphan SPR branches from the remote
     Cleanup(commands::cleanup::CleanupOptions),
 
+    /// Show the local stack next to its Pull Requests and GitHub stack, and
+    /// point out anything that does not match
+    Stack(commands::stack::StackOptions),
+
     /// Update the local stack after Pull Requests merged: abandon the merged
     /// changes and rebase the rest onto the main branch
     Sync(commands::sync::SyncOptions),
@@ -200,6 +204,7 @@ pub async fn spr() -> Result<()> {
         Commands::Close(opts) => commands::close::close(opts, &jj, &mut gh, &config).await?,
         Commands::Cleanup(opts) => commands::cleanup::cleanup(opts, &jj, &gh, &config).await?,
         Commands::Sync(opts) => commands::sync::sync(opts, &jj, &mut gh, &config).await?,
+        Commands::Stack(opts) => commands::stack::stack(opts, &jj, &gh, &config).await?,
         // The following commands are executed above and return from this
         // function before it reaches this match.
         Commands::Init | Commands::Format(_) => (),
