@@ -205,6 +205,22 @@ impl Jujutsu {
             .commit(None, &author, &committer, message, &tree, &parent_refs)?)
     }
 
+    /// Three-way merge of trees: `ours` with the changes from `base` to
+    /// `theirs` applied. `None` when the merge conflicts.
+    pub fn merge_trees(&self, base: Oid, ours: Oid, theirs: Oid) -> Result<Option<Oid>> {
+        let repo = &self.git_repo;
+        let mut merged = repo.merge_trees(
+            &repo.find_tree(base)?,
+            &repo.find_tree(ours)?,
+            &repo.find_tree(theirs)?,
+            None,
+        )?;
+        if merged.has_conflicts() {
+            return Ok(None);
+        }
+        Ok(Some(merged.write_tree_to(repo)?))
+    }
+
     pub fn cherrypick(&self, commit_oid: Oid, onto_oid: Oid) -> Result<git2::Index> {
         let commit = self.git_repo.find_commit(commit_oid)?;
         let onto_commit = self.git_repo.find_commit(onto_oid)?;
@@ -270,7 +286,7 @@ impl Jujutsu {
         Ok(())
     }
 
-    fn prepare_commit(&self, config: &Config, commit_oid: Oid) -> Result<PreparedCommit> {
+    pub fn prepare_commit(&self, config: &Config, commit_oid: Oid) -> Result<PreparedCommit> {
         let commit = self.git_repo.find_commit(commit_oid)?;
         let short_id = format!("{:.7}", commit_oid);
 
