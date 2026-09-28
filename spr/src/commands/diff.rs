@@ -62,6 +62,64 @@ pub struct DiffOptions {
     /// Preview what would happen without pushing or creating PRs
     #[clap(long)]
     pub dry_run: bool,
+
+    /// Publish dependent changes as a native GitHub stack: each Pull Request
+    /// targets the Pull Request branch of its parent change, and the chain is
+    /// registered with GitHub's stacked pull requests. Defaults to the
+    /// `spr.nativeStacks` setting.
+    #[clap(long)]
+    native_stack: bool,
+
+    /// Use jj-spr's own base branches for dependent changes, even if
+    /// `spr.nativeStacks` is set.
+    #[clap(long, conflicts_with = "native_stack")]
+    no_native_stack: bool,
+}
+
+/// The Pull Request branch of a change's parent, which a natively stacked
+/// Pull Request targets.
+#[derive(Debug, Clone)]
+struct ParentPullRequest {
+    number: Option<u64>,
+    branch: crate::github::GitHubBranch,
+    head_oid: Oid,
+}
+
+/// What `diff_impl` published (or would publish, in a dry run) for one change.
+#[derive(Debug, Clone)]
+struct Published {
+    number: Option<u64>,
+    head: crate::github::GitHubBranch,
+    head_oid: Oid,
+    base: String,
+}
+
+fn resolve_native_stack(opts: &DiffOptions, config: &crate::config::Config) -> bool {
+    if opts.native_stack {
+        true
+    } else if opts.no_native_stack {
+        false
+    } else {
+        config.native_stacks
+    }
+}
+
+/// Whether the change will be submitted as a cherry-pick, without changing
+/// its message (see `resolve_cherry_pick`).
+fn wants_cherry_pick(opts: &DiffOptions, message: &crate::message::MessageSectionsMap) -> bool {
+    if opts.no_cherry_pick {
+        return false;
+    }
+    opts.cherry_pick
+        || message
+            .get(&MessageSection::CherryPick)
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+/// `ancestor` is `descendant` or one of its ancestors.
+fn is_ancestor(jj: &crate::jj::Jujutsu, ancestor: Oid, descendant: Oid) -> Result<bool> {
+    Ok(ancestor == descendant || jj.git_repo.graph_descendant_of(descendant, ancestor)?)
 }
 
 /// Resolve the effective cherry-pick state from CLI flags and the "Cherry Pick:"
@@ -136,6 +194,8 @@ pub async fn diff(
         return result;
     };
 
+    let native = resolve_native_stack(&opts, config);
+
     #[allow(clippy::needless_collect)]
     let pull_request_tasks: Vec<_> = prepared_commits
         .iter()
@@ -145,29 +205,95 @@ pub async fn diff(
         })
         .collect();
 
-    let mut message_on_prompt = "".to_string();
+    let mut pull_requests: Vec<Option<PullRequest>> = Vec::new();
+    for task in pull_request_tasks {
+        pull_requests.push(match task {
+            Some(task) => Some(task.await??),
+            None => None,
+        });
+    }
 
-    for (prepared_commit, pull_request_task) in zip(prepared_commits.iter_mut(), pull_request_tasks)
-    {
+    // With native stacks, GitHub refuses to change the base of a Pull Request
+    // that is part of a stack. Work out up front which stacks this run is
+    // about to invalidate, and dissolve them before changing anything; they
+    // are rebuilt once every Pull Request is published.
+    let mut stacks_available = true;
+    if native && use_range_mode {
+        match gh.list_stacks().await? {
+            None => stacks_available = false,
+            Some(stacks) => {
+                let planned = plan_native_bases(
+                    &opts,
+                    config,
+                    &prepared_commits,
+                    &pull_requests,
+                    master_base_oid,
+                );
+                let to_dissolve =
+                    crate::stacks::plan_unstacks(&stacks, &planned).map_err(Error::new)?;
+                for stack in to_dissolve {
+                    if opts.dry_run {
+                        output(
+                            "🧱",
+                            &format!("Would dissolve GitHub stack #{stack} to rebuild it"),
+                        )?;
+                    } else {
+                        output(
+                            "🧱",
+                            &format!("Dissolving GitHub stack #{stack} to rebuild it"),
+                        )?;
+                        gh.unstack(stack).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut message_on_prompt = "".to_string();
+    let mut parent: Option<ParentPullRequest> = None;
+    // Published Pull Requests in local parent order, for registering stacks.
+    let mut published_links: Vec<Published> = Vec::new();
+
+    for (prepared_commit, pull_request) in zip(prepared_commits.iter_mut(), pull_requests) {
         if result.is_err() {
             break;
         }
 
-        let pull_request = if let Some(task) = pull_request_task {
-            Some(task.await??)
-        } else {
-            None
-        };
-
         if !opts.dry_run {
             write_commit_title(prepared_commit)?;
+        }
+
+        // A change that is not directly on master is stacked on its parent's
+        // Pull Request. In range mode that is the one we just published;
+        // otherwise look it up.
+        let stacked_on_parent = native
+            && prepared_commit.parent_oid != master_base_oid
+            && !wants_cherry_pick(&opts, &prepared_commit.message);
+        if stacked_on_parent && parent.is_none() {
+            match lookup_parent_pull_request(jj, gh, config, prepared_commit).await {
+                Ok(found) => {
+                    if let Some(number) = found.number {
+                        published_links.push(Published {
+                            number: Some(number),
+                            head: found.branch.clone(),
+                            head_oid: found.head_oid,
+                            base: String::new(),
+                        });
+                    }
+                    parent = Some(found);
+                }
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
         }
 
         // The further implementation of the diff command is in a separate function.
         // This makes it easier to run the code to update the local commit message
         // with all the changes that the implementation makes at the end, even if
         // the implementation encounters an error or exits early.
-        result = diff_impl(
+        let outcome = diff_impl(
             &opts,
             &mut message_on_prompt,
             jj,
@@ -176,8 +302,33 @@ pub async fn diff(
             prepared_commit,
             master_base_oid,
             pull_request,
+            native,
+            if stacked_on_parent {
+                parent.as_ref()
+            } else {
+                None
+            },
         )
         .await;
+
+        match outcome {
+            Ok(published) => {
+                parent = use_range_mode.then(|| ParentPullRequest {
+                    number: published.number,
+                    branch: published.head.clone(),
+                    head_oid: published.head_oid,
+                });
+                published_links.push(published);
+            }
+            Err(error) => result = Err(error),
+        }
+    }
+
+    if native && result.is_ok() {
+        add_error(
+            &mut result,
+            register_native_stacks(&opts, gh, config, &published_links, stacks_available).await,
+        );
     }
 
     // This updates the commit message in the local Jujutsu repository (if it was
@@ -258,6 +409,188 @@ pub async fn diff(
     result
 }
 
+/// Predict each selected Pull Request's base branch after this run, for
+/// deciding which native stacks survive it.
+fn plan_native_bases(
+    opts: &DiffOptions,
+    config: &crate::config::Config,
+    commits: &[crate::jj::PreparedCommit],
+    pull_requests: &[Option<PullRequest>],
+    master_base_oid: Oid,
+) -> Vec<crate::stacks::PlannedPullRequest> {
+    commits
+        .iter()
+        .enumerate()
+        .map(|(i, commit)| {
+            let pull_request = pull_requests[i].as_ref();
+            let expected_base = if commit.parent_oid == master_base_oid
+                || wants_cherry_pick(opts, &commit.message)
+            {
+                Some(config.master_ref.branch_name().to_string())
+            } else if i > 0 {
+                pull_requests[i - 1]
+                    .as_ref()
+                    .map(|parent| parent.head.branch_name().to_string())
+            } else {
+                None
+            };
+            crate::stacks::PlannedPullRequest {
+                number: pull_request.map(|pr| pr.number),
+                current_base: pull_request.map(|pr| pr.base.branch_name().to_string()),
+                expected_base,
+            }
+        })
+        .collect()
+}
+
+/// Find the Pull Request of a change's parent, which a natively stacked Pull
+/// Request targets when the parent is not part of this run.
+async fn lookup_parent_pull_request(
+    jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    commit: &crate::jj::PreparedCommit,
+) -> Result<ParentPullRequest> {
+    let parent_commit =
+        jj.get_prepared_commit_for_revision(config, &commit.parent_oid.to_string())?;
+    let number = parent_commit.pull_request_number.ok_or_else(|| {
+        Error::new(formatdoc!(
+            "The parent change {} has no Pull Request yet. A natively stacked \
+             Pull Request targets its parent's Pull Request, so submit the \
+             whole stack with `jj spr diff --all`.",
+            parent_commit.short_id
+        ))
+    })?;
+    let pull_request = gh.clone().get_pull_request(number).await?;
+    if pull_request.state != PullRequestState::Open {
+        return Err(Error::new(formatdoc!(
+            "The parent change's Pull Request #{number} is closed. Rebase this \
+             change before submitting it.",
+        )));
+    }
+    Ok(ParentPullRequest {
+        number: Some(number),
+        branch: pull_request.head,
+        head_oid: pull_request.head_oid,
+    })
+}
+
+/// Register the published chains of Pull Requests as native GitHub stacks.
+/// The Pull Requests are already correct at this point, so problems with the
+/// stack itself are reported as warnings.
+async fn register_native_stacks(
+    opts: &DiffOptions,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    published: &[Published],
+    stacks_available: bool,
+) -> Result<()> {
+    use crate::stacks::{
+        PublishedLink, StackAction, chain_segments, format_pr_list, plan_stack_updates,
+    };
+
+    if opts.dry_run {
+        let mut chain: Vec<String> = Vec::new();
+        let mut previous: Option<&Published> = None;
+        let report = |chain: &mut Vec<String>| -> Result<()> {
+            if chain.len() >= 2 {
+                output(
+                    "🧱",
+                    &format!("Would register GitHub stack: {}", chain.join(" ← ")),
+                )?;
+            }
+            chain.clear();
+            Ok(())
+        };
+        for link in published {
+            if previous.is_some_and(|p| p.head.branch_name() != link.base) {
+                report(&mut chain)?;
+            }
+            chain.push(
+                link.number
+                    .map_or("new PR".to_string(), |n| format!("#{n}")),
+            );
+            previous = Some(link);
+        }
+        report(&mut chain)?;
+        return Ok(());
+    }
+
+    let links: Vec<PublishedLink> = published
+        .iter()
+        .filter_map(|p| {
+            p.number.map(|number| PublishedLink {
+                number,
+                base: p.base.clone(),
+                head: p.head.branch_name().to_string(),
+            })
+        })
+        .collect();
+    let segments = chain_segments(&links);
+    if segments.is_empty() {
+        return Ok(());
+    }
+
+    let stacks = if stacks_available {
+        gh.list_stacks().await?
+    } else {
+        None
+    };
+    let Some(stacks) = stacks else {
+        output(
+            "ℹ️ ",
+            &format!(
+                "Stacked pull requests are not enabled for {}/{}; the Pull Requests \
+                 target each other but are not registered as a GitHub stack.",
+                config.owner, config.repo
+            ),
+        )?;
+        return Ok(());
+    };
+
+    for action in plan_stack_updates(&stacks, &segments) {
+        match action {
+            StackAction::Create(pull_requests) => match gh.create_stack(&pull_requests).await {
+                Ok(stack) => output(
+                    "🧱",
+                    &format!(
+                        "Created GitHub stack #{}: {}",
+                        stack.number,
+                        format_pr_list(&pull_requests)
+                    ),
+                )?,
+                Err(error) => {
+                    output("⚠️", "Creating the GitHub stack failed")?;
+                    for message in error.messages() {
+                        output("  ", message)?;
+                    }
+                }
+            },
+            StackAction::Add {
+                stack,
+                pull_requests,
+            } => match gh.add_to_stack(stack, &pull_requests).await {
+                Ok(_) => output(
+                    "🧱",
+                    &format!(
+                        "Added {} to GitHub stack #{stack}",
+                        format_pr_list(&pull_requests)
+                    ),
+                )?,
+                Err(error) => {
+                    output("⚠️", &format!("Adding to GitHub stack #{stack} failed"))?;
+                    for message in error.messages() {
+                        output("  ", message)?;
+                    }
+                }
+            },
+            StackAction::Warn(message) => output("⚠️", &message)?,
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn diff_impl(
     opts: &DiffOptions,
@@ -268,7 +601,9 @@ async fn diff_impl(
     local_commit: &mut crate::jj::PreparedCommit,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
-) -> Result<()> {
+    native: bool,
+    native_parent: Option<&ParentPullRequest>,
+) -> Result<Published> {
     // Parsed commit message of the local commit
     let message = &mut local_commit.message;
 
@@ -456,11 +791,27 @@ async fn diff_impl(
         };
     let needs_merging_master = pr_master_base != master_base_oid;
 
+    // With native stacks, an existing Pull Request also needs an update when
+    // it does not target (and contain) its parent's current Pull Request
+    // branch, or targets anything but master when it has no parent PR.
+    let base_is_expected = match (&pull_request, native, native_parent) {
+        (Some(pr), true, Some(parent)) => {
+            pr.base.branch_name() == parent.branch.branch_name()
+                && is_ancestor(jj, parent.head_oid, pr.head_oid)?
+        }
+        (Some(pr), true, None) => pr.base.is_master_branch(),
+        _ => true,
+    };
+
     // At this point we can check if we can exit early because no update to the
     // existing Pull Request is necessary
     if let Some(ref pull_request) = pull_request {
         // So there is an existing Pull Request...
-        if !needs_merging_master && pr_head_tree == new_head_tree && pr_base_tree == new_base_tree {
+        if !needs_merging_master
+            && base_is_expected
+            && pr_head_tree == new_head_tree
+            && pr_base_tree == new_base_tree
+        {
             // ...and it does not need a rebase, and the trees of both Pull
             // Request branch and base are all the right ones.
             output("✅", "No update necessary")?;
@@ -487,7 +838,12 @@ async fn diff_impl(
                 }
             }
 
-            return Ok(());
+            return Ok(Published {
+                number: Some(pull_request.number),
+                head: pull_request.head.clone(),
+                head_oid: pull_request.head_oid,
+                base: pull_request.base.branch_name().to_string(),
+            });
         }
     }
 
@@ -543,7 +899,36 @@ async fn diff_impl(
     // commit is not directly based on master, we have to create this new PR
     // with a base branch, so that is case 3.
 
-    let (pr_base_parent, base_branch) = if pr_base_tree == new_base_tree && !needs_merging_master {
+    let (pr_base_parent, base_branch) = if let Some(parent) = native_parent {
+        // Native stack: the Pull Request targets the parent change's Pull
+        // Request branch, and its new commit merges in that branch's head.
+        // That keeps GitHub's diff (against the merge base) down to exactly
+        // this change. No base branch of our own is created.
+        if !opts.dry_run && jj.get_tree_oid_for_commit(parent.head_oid)? != new_base_tree {
+            return Err(Error::new(formatdoc!(
+                "The Pull Request for the parent change{} does not contain the                  parent change as it is locally (was it submitted with                  --cherry-pick, or not updated yet?). Run `jj spr diff --all`                  to update the whole stack.",
+                parent
+                    .number
+                    .map(|n| format!(" (#{n})"))
+                    .unwrap_or_default()
+            )));
+        }
+        let merge_in_parent =
+            pull_request.is_none() || !is_ancestor(jj, parent.head_oid, pr_head_oid)?;
+        (
+            merge_in_parent.then_some(parent.head_oid),
+            Some(parent.branch.clone()),
+        )
+    } else if native {
+        // Native stack, but no parent PR: this Pull Request targets master,
+        // even if it used to target a parent's branch or one of jj-spr's
+        // base branches.
+        if pr_base_tree == new_base_tree && !needs_merging_master && base_is_expected {
+            (None, None)
+        } else {
+            (Some(master_base_oid), None)
+        }
+    } else if pr_base_tree == new_base_tree && !needs_merging_master {
         // Case 1
         (None, base_branch)
     } else if base_branch.is_none() && (directly_based_on_master || effective_cherry_pick) {
@@ -624,7 +1009,13 @@ async fn diff_impl(
     // Construct the new commit for the Pull Request branch. First parent is the
     // current head commit of the Pull Request (we set this to the master base
     // commit earlier if the Pull Request does not yet exist)
-    let mut pr_commit_parents = vec![pr_head_oid];
+    let mut pr_commit_parents = if pull_request.is_none() && native_parent.is_some() {
+        // A new natively stacked Pull Request starts on top of its parent's
+        // Pull Request branch.
+        vec![]
+    } else {
+        vec![pr_head_oid]
+    };
 
     // If we prepared a commit earlier that needs merging into the Pull Request
     // branch, then that commit is a parent of the new Pull Request commit.
@@ -635,6 +1026,8 @@ async fn diff_impl(
             pr_commit_parents.push(oid);
         }
     }
+
+    let mut published_number = pull_request.as_ref().map(|pr| pr.number);
 
     // Create the new commit
     let pr_commit = if opts.dry_run {
@@ -717,12 +1110,14 @@ async fn diff_impl(
                 pull_request_updates.update_message(&pull_request, message);
             }
 
-            if let Some(base_branch) = base_branch {
+            if let Some(ref base_branch) = base_branch {
                 // We are using a base branch.
 
-                if let Some(base_branch_commit) = pr_base_parent {
+                if let Some(base_branch_commit) = pr_base_parent.filter(|_| native_parent.is_none())
+                {
                     // ...and we prepared a new commit for it, so we need to push an
-                    // update of the base branch.
+                    // update of the base branch. (A natively stacked PR's base is
+                    // its parent's PR branch, which was pushed already.)
                     cmd.arg(format!(
                         "{}:{}",
                         base_branch_commit,
@@ -747,17 +1142,38 @@ async fn diff_impl(
                 run_command(&mut cmd)
                     .await
                     .reword("git push failed".to_string())?;
+
+                // A natively stacked Pull Request whose parent is gone (landed,
+                // or abandoned locally) moves back to master.
+                if !pull_request.base.is_master_branch() {
+                    pull_request_updates.base = Some(config.master_ref.branch_name().to_string());
+                }
             }
 
             if !pull_request_updates.is_empty() {
-                gh.update_pull_request(pull_request.number, pull_request_updates)
-                    .await?;
+                let changes_base = pull_request_updates.base.is_some();
+                let update = gh
+                    .update_pull_request(pull_request.number, pull_request_updates)
+                    .await;
+                if native && changes_base {
+                    update.context(
+                        "GitHub does not allow changing the base of a Pull Request \
+                         in a stack. Run `jj spr diff --all` from the top of the \
+                         stack so jj-spr can rebuild it."
+                            .to_string(),
+                    )?;
+                } else {
+                    update?;
+                }
             }
         } else {
             // We are creating a new Pull Request.
 
-            // If there's a base branch, add it to the push
-            if let (Some(base_branch), Some(base_branch_commit)) = (&base_branch, pr_base_parent) {
+            // If there's a base branch, add it to the push (unless it is the
+            // parent's Pull Request branch, which was pushed already)
+            if let (Some(base_branch), Some(base_branch_commit), None) =
+                (&base_branch, pr_base_parent, native_parent)
+            {
                 cmd.arg(format!(
                     "{}:{}",
                     base_branch_commit,
@@ -783,6 +1199,7 @@ async fn diff_impl(
                 )
                 .await?;
 
+            published_number = Some(pull_request_number);
             let pull_request_url = config.pull_request_url(pull_request_number);
 
             output(
@@ -811,7 +1228,16 @@ async fn diff_impl(
         }
     }
 
-    Ok(())
+    Ok(Published {
+        number: published_number,
+        head: pull_request_branch,
+        head_oid: pr_commit,
+        base: base_branch
+            .as_ref()
+            .unwrap_or(&config.master_ref)
+            .branch_name()
+            .to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -909,6 +1335,8 @@ mod tests {
             base: None,
             revision: None,
             dry_run: false,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         assert!(!opts.all);
@@ -931,6 +1359,8 @@ mod tests {
             base: Some("main".to_string()),
             revision: None,
             dry_run: false,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         assert_eq!(opts.base, Some("main".to_string()));
@@ -958,6 +1388,8 @@ mod tests {
             base: Some("main".to_string()),
             revision: None,
             dry_run: false,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         assert_eq!(opts_with_base.base.as_deref(), Some("main"));
@@ -973,6 +1405,8 @@ mod tests {
             base: Some("trunk()".to_string()),
             revision: None,
             dry_run: false,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         assert_eq!(opts_with_trunk.base.as_deref(), Some("trunk()"));
@@ -990,6 +1424,8 @@ mod tests {
             base: Some("trunk()".to_string()),
             revision: None,
             dry_run: false,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         // When --all is specified, it should work with base revisions
@@ -1010,6 +1446,8 @@ mod tests {
             base: Some("trunk()".to_string()),
             revision: None,
             dry_run: false,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         assert!(opts.all);
@@ -1032,6 +1470,8 @@ mod tests {
             base: None,
             revision: None,
             dry_run: true,
+            native_stack: false,
+            no_native_stack: false,
         };
 
         assert!(opts.dry_run);
