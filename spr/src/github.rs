@@ -35,6 +35,11 @@ pub struct PullRequest {
     pub head: GitHubBranch,
     pub base_oid: git2::Oid,
     pub head_oid: git2::Oid,
+    /// The head commit as GitHub reports it. Unlike `head_oid`, which comes
+    /// from the local remote-tracking ref, this is still known after the
+    /// Pull Request's branch has been deleted.
+    pub github_head_oid: Option<git2::Oid>,
+    pub is_draft: bool,
     pub merge_commit: Option<git2::Oid>,
     pub reviewers: HashMap<String, ReviewStatus>,
     pub review_decision: ReviewDecision,
@@ -207,7 +212,10 @@ impl GitHub {
         let base = config.new_github_branch_from_ref(&pr.base_ref_name)?;
         let head = config.new_github_branch_from_ref(&pr.head_ref_name)?;
 
-        // Fetch refs from remote using git (since we're in a colocated repo)
+        // Fetch refs from remote using git (since we're in a colocated repo).
+        // The refspecs are forced, like git's default ones: GitHub rewrites
+        // Pull Request branches (after a stacked merge, for example), and the
+        // local copies must follow even then.
         let _fetch_result = tokio::process::Command::new("git")
             .args([
                 "--git-dir",
@@ -215,8 +223,8 @@ impl GitHub {
                 "fetch",
                 "--no-write-fetch-head",
                 &config.remote_name,
-                &format!("{}:{}", head.on_github(), head.local()),
-                &format!("{}:{}", base.on_github(), base.local()),
+                &format!("+{}:{}", head.on_github(), head.local()),
+                &format!("+{}:{}", base.on_github(), base.local()),
             ])
             .output()
             .await;
@@ -228,6 +236,8 @@ impl GitHub {
         };
         let base_oid = rev_parse(base.local());
         let head_oid = rev_parse(head.local());
+
+        let github_head_oid = git2::Oid::from_str(&pr.head_ref_oid).ok();
 
         let mut sections = parse_message(&pr.body, MessageSection::Summary);
 
@@ -341,6 +351,8 @@ impl GitHub {
             head,
             base_oid,
             head_oid,
+            github_head_oid,
+            is_draft: pr.is_draft,
             reviewers,
             review_decision,
             merge_commit: pr

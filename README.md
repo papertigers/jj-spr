@@ -101,9 +101,8 @@ jj spr diff  # Updates PR with new commit (reviewers see clean diff)
 # 5. Land when approved
 jj spr land -r @-
 
-# 6. Rebase after landing
-jj git fetch
-jj rebase -r @ -d main@origin
+# 6. Abandon the landed change and rebase onto the new main
+jj spr sync
 ```
 
 ## Key Concepts
