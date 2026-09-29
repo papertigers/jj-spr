@@ -142,7 +142,12 @@ pub async fn spr() -> Result<()> {
         github_master_branch,
         branch_prefix,
         require_approval,
-    );
+    )
+    .with_github_api_url(
+        get_config_value("spr.githubApiUrl", &git_config)
+            .unwrap_or_else(|| jj_spr::config::DEFAULT_GITHUB_API_URL.to_string()),
+    )
+    .with_native_stacks(get_config_bool("spr.nativeStacks", &git_config).unwrap_or(false));
 
     if let Commands::Format(opts) = cli.command {
         return commands::format::format(opts, &jj, &config).await;
@@ -157,6 +162,7 @@ pub async fn spr() -> Result<()> {
     octocrab::initialise(
         octocrab::OctocrabBuilder::default()
             .personal_token(github_auth_token.clone())
+            .base_uri(config.github_api_url.as_str())?
             .build()?,
     );
 

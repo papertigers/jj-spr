@@ -112,6 +112,37 @@ pub async fn land(
     // cherry-picked the commit onto master.
     let pr_head_oid = pull_request.head_oid;
 
+    // A Pull Request in a native GitHub stack can only be merged from the
+    // bottom of the stack, and only through GitHub's stack-aware merge.
+    let stack = match gh.list_stacks().await {
+        Ok(Some(stacks)) => stacks
+            .into_iter()
+            .find(|stack| stack.active_pull_requests().contains(&pull_request_number)),
+        _ => None,
+    };
+    if let Some(stack) = &stack {
+        let active = stack.active_pull_requests();
+        if active.first() != Some(&pull_request_number) || !base_is_master {
+            return Err(Error::new(format!(
+                "Pull Request #{} is not at the bottom of GitHub stack #{}. \
+                 Land {} first.",
+                pull_request_number,
+                stack.number,
+                crate::stacks::format_pr_list(
+                    &active
+                        .iter()
+                        .copied()
+                        .take_while(|n| *n != pull_request_number)
+                        .collect::<Vec<_>>()
+                ),
+            )));
+        }
+        output(
+            "🧱",
+            &format!("Merging from the bottom of GitHub stack #{}", stack.number),
+        )?;
+    }
+
     if !base_is_master {
         // The base of the Pull Request on GitHub is not set to master. This
         // means the Pull Request uses a base branch. We tested above that
@@ -210,36 +241,45 @@ pub async fn land(
             // used a base branch with this Pull Request or not. We have made sure the
             // target of the Pull Request is set to the master branch. So let GitHub do
             // the merge now!
-            octocrab::instance()
-                .pulls(&config.owner, &config.repo)
-                .merge(pull_request_number)
-                .method(octocrab::params::pulls::MergeMethod::Squash)
-                .title(pull_request.title)
-                .message(build_github_body_for_merging(&pull_request.sections))
-                .sha(format!("{}", pr_head_oid))
-                .send()
-                .await
-                .convert()
-                .context(format!(
-                    "squash-merging PR #{} (head {})",
-                    pull_request_number, pr_head_oid
-                ))
-                .and_then(|merge| {
-                    if merge.merged {
-                        Ok(merge)
-                    } else {
-                        Err(Error::new(formatdoc!(
-                            "GitHub Pull Request merge failed: {}",
-                            merge.message.unwrap_or_default()
-                        )))
-                    }
-                })
+            if stack.is_some() {
+                gh.merge_stacked_pull_request(pull_request_number, pr_head_oid, "squash")
+                    .await
+                    .context(format!(
+                        "squash-merging PR #{} (head {})",
+                        pull_request_number, pr_head_oid
+                    ))
+            } else {
+                octocrab::instance()
+                    .pulls(&config.owner, &config.repo)
+                    .merge(pull_request_number)
+                    .method(octocrab::params::pulls::MergeMethod::Squash)
+                    .title(pull_request.title)
+                    .message(build_github_body_for_merging(&pull_request.sections))
+                    .sha(format!("{}", pr_head_oid))
+                    .send()
+                    .await
+                    .convert()
+                    .context(format!(
+                        "squash-merging PR #{} (head {})",
+                        pull_request_number, pr_head_oid
+                    ))
+                    .and_then(|merge| {
+                        if merge.merged {
+                            Ok(merge.sha)
+                        } else {
+                            Err(Error::new(formatdoc!(
+                                "GitHub Pull Request merge failed: {}",
+                                merge.message.unwrap_or_default()
+                            )))
+                        }
+                    })
+            }
         }
         Err(err) => Err(err),
     };
 
-    let merge = match result {
-        Ok(merge) => merge,
+    let merged_sha = match result {
+        Ok(sha) => sha,
         Err(mut error) => {
             output("❌", "GitHub Pull Request merge failed")?;
 
@@ -266,19 +306,70 @@ pub async fn land(
 
     output("🛬", "Landed!")?;
 
-    let mut remove_old_branch_child_process = jj
-        .git_command()
-        .arg("push")
-        .arg("--no-verify")
-        .arg("--delete")
-        .arg("--")
-        .arg(&config.remote_name)
-        .arg(pull_request.head.on_github())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    // Other open Pull Requests may target this Pull Request's branch (natively
+    // stacked PRs do). GitHub closes a Pull Request whose base branch is
+    // deleted, so move them to master first, and keep any branch that another
+    // open Pull Request still uses.
+    let open_pull_requests = gh.get_open_pull_requests().await.unwrap_or_default();
+    let mut keep_head_branch = false;
+    for dependent in open_pull_requests.iter().filter(|pr| {
+        pr.number != pull_request_number && pr.base_ref_name == pull_request.head.branch_name()
+    }) {
+        let retarget = gh
+            .update_pull_request(
+                dependent.number,
+                PullRequestUpdate {
+                    base: Some(config.master_ref.branch_name().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        match retarget {
+            Ok(()) => output(
+                "↪️ ",
+                &format!(
+                    "Pull Request #{} now targets {}",
+                    dependent.number,
+                    config.master_ref.branch_name()
+                ),
+            )?,
+            Err(_) => {
+                keep_head_branch = true;
+                output(
+                    "⚠️",
+                    &format!(
+                        "Pull Request #{} still targets {}; keeping that branch",
+                        dependent.number,
+                        pull_request.head.branch_name()
+                    ),
+                )?;
+            }
+        }
+    }
+    let base_used_elsewhere = open_pull_requests.iter().any(|pr| {
+        pr.number != pull_request_number
+            && (pr.head_ref_name == pull_request.base.branch_name()
+                || pr.base_ref_name == pull_request.base.branch_name())
+    });
 
-    let remove_old_base_branch_child_process = if base_is_master {
+    let remove_old_branch_child_process = if keep_head_branch {
+        None
+    } else {
+        Some(
+            jj.git_command()
+                .arg("push")
+                .arg("--no-verify")
+                .arg("--delete")
+                .arg("--")
+                .arg(&config.remote_name)
+                .arg(pull_request.head.on_github())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        )
+    };
+
+    let remove_old_base_branch_child_process = if base_is_master || base_used_elsewhere {
         None
     } else {
         Some(
@@ -296,7 +387,7 @@ pub async fn land(
     };
 
     // Rebase us on top of the now-landed commit
-    if let Some(sha) = merge.sha {
+    if let Some(sha) = merged_sha {
         // Try this up to three times, because fetching the very moment after
         // the merge might still not find the new commit.
         for i in 0..3 {
@@ -331,7 +422,9 @@ pub async fn land(
     // Wait for the "git push" to delete the old Pull Request branch to finish,
     // but ignore the result. GitHub may be configured to delete the branch
     // automatically, in which case it's gone already and this command fails.
-    remove_old_branch_child_process.wait().await?;
+    if let Some(mut proc) = remove_old_branch_child_process {
+        proc.wait().await?;
+    }
     if let Some(mut proc) = remove_old_base_branch_child_process {
         proc.wait().await?;
     }
