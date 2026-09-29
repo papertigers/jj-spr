@@ -1027,6 +1027,34 @@ async fn diff_impl(
         }
     }
 
+    // In a native stack, GitHub rebases the Pull Requests left after a stacked
+    // merge by replaying their commits and dropping merge commits. An update
+    // that merges in a new parent head and also carries local edits would
+    // lose those edits there, so split it: a merge commit with only the
+    // merged result, then an ordinary commit with the local change's tree.
+    // (If the merge conflicts, keep the single merge commit.)
+    if native && pull_request.is_some() && pr_commit_parents.len() == 2 && !opts.dry_run {
+        let repo = &jj.git_repo;
+        let mut merged = repo.merge_trees(
+            &repo.find_tree(pr_base_tree)?,
+            &repo.find_tree(pr_head_tree)?,
+            &repo.find_tree(new_base_tree)?,
+            None,
+        )?;
+        if !merged.has_conflicts() {
+            let merged_tree = merged.write_tree_to(repo)?;
+            if merged_tree != new_head_tree {
+                let merge_commit = jj.create_derived_commit(
+                    local_commit.oid,
+                    "[spr] changes introduced through rebase",
+                    merged_tree,
+                    &pr_commit_parents[..],
+                )?;
+                pr_commit_parents = vec![merge_commit];
+            }
+        }
+    }
+
     let mut published_number = pull_request.as_ref().map(|pr| pr.number);
 
     // Create the new commit

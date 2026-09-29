@@ -206,7 +206,10 @@ impl GitHub {
         let base = config.new_github_branch_from_ref(&pr.base_ref_name)?;
         let head = config.new_github_branch_from_ref(&pr.head_ref_name)?;
 
-        // Fetch refs from remote using git (since we're in a colocated repo)
+        // Fetch refs from remote using git (since we're in a colocated repo).
+        // The refspecs are forced, like git's default ones: GitHub rewrites
+        // Pull Request branches (after a stacked merge, for example), and the
+        // local copies must follow even then.
         let _fetch_result = tokio::process::Command::new("git")
             .args([
                 "--git-dir",
@@ -214,42 +217,29 @@ impl GitHub {
                 "fetch",
                 "--no-write-fetch-head",
                 &config.remote_name,
-                &format!("{}:{}", head.on_github(), head.local()),
-                &format!("{}:{}", base.on_github(), base.local()),
+                &format!("+{}:{}", head.on_github(), head.local()),
+                &format!("+{}:{}", base.on_github(), base.local()),
             ])
             .output()
             .await;
 
-        // Convert branch refs to OIDs
-        let base_oid = if let Ok(output) = tokio::process::Command::new("git")
-            .args(["--git-dir", repo_path, "rev-parse", base.local()])
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
-            } else {
-                git2::Oid::zero()
+        let rev_parse = |reference: String| async move {
+            match tokio::process::Command::new("git")
+                .args(["--git-dir", repo_path, "rev-parse", &reference])
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() => {
+                    let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
+                }
+                _ => git2::Oid::zero(),
             }
-        } else {
-            git2::Oid::zero()
         };
+        let base_oid = rev_parse(base.local().to_string()).await;
+        let head_oid = rev_parse(head.local().to_string()).await;
 
-        let head_oid = if let Ok(output) = tokio::process::Command::new("git")
-            .args(["--git-dir", repo_path, "rev-parse", head.local()])
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let oid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                git2::Oid::from_str(&oid_str).unwrap_or(git2::Oid::zero())
-            } else {
-                git2::Oid::zero()
-            }
-        } else {
-            git2::Oid::zero()
-        };
+        let github_head_oid = git2::Oid::from_str(&pr.head_ref_oid).ok();
 
         let mut sections = parse_message(&pr.body, MessageSection::Summary);
 
@@ -362,7 +352,7 @@ impl GitHub {
             head,
             base_oid,
             head_oid,
-            github_head_oid: git2::Oid::from_str(&pr.head_ref_oid).ok(),
+            github_head_oid,
             is_draft: pr.is_draft,
             reviewers,
             review_status,

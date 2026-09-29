@@ -1,6 +1,5 @@
 //! A jj repository whose `origin` is a bare Git repository served by the fake
 //! GitHub, plus helpers for driving `jj` and `jj-spr` and checking the result.
-//! This is the Rust counterpart of `Env` in `tests/native_stacks/run_scenarios.py`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
