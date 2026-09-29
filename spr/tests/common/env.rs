@@ -290,6 +290,36 @@ impl TestEnv {
             .collect()
     }
 
+    /// Whether a change is still visible (not abandoned).
+    pub fn is_visible(&self, change: &str) -> bool {
+        !self
+            .jj_query(&[
+                "log",
+                "--no-graph",
+                "-r",
+                &format!("present({change})"),
+                "-T",
+                "change_id",
+            ])
+            .trim()
+            .is_empty()
+    }
+
+    /// The commit ID of a change's parent.
+    pub fn parent_of(&self, change: &str) -> String {
+        self.commit_id(&format!("{change}-"))
+    }
+
+    /// Commit a new file on main from another clone and push it, as a
+    /// colleague would.
+    pub fn push_to_main(&self, path: &str, content: &str) {
+        self.git_in(&self.seed, &["pull", "-q", "origin", "main"]);
+        std::fs::write(self.seed.join(path), content).unwrap();
+        self.git_in(&self.seed, &["add", path]);
+        self.git_in(&self.seed, &["commit", "-q", "-m", &format!("Add {path}")]);
+        self.git_in(&self.seed, &["push", "-q", "origin", "main"]);
+    }
+
     /// Every PR targets the one below, shows only its own files, has the local
     /// change's tree, and the PRs form one active stack.
     pub fn check_chain(&self, changes: &[String]) -> Vec<u64> {
