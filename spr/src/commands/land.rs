@@ -23,9 +23,16 @@ pub struct LandOptions {
     #[clap(long)]
     cherry_pick: bool,
 
-    /// Jujutsu revision to operate on (if not specified, uses '@')
+    /// Jujutsu revision to operate on (if not specified, uses '@'). In a
+    /// native GitHub stack this can be any Pull Request of the stack: it is
+    /// merged together with every Pull Request below it.
     #[clap(short = 'r', long)]
     revision: Option<String>,
+
+    /// Merge the Pull Requests below the chosen one in its stack without
+    /// asking (required when not running in a terminal)
+    #[clap(long, short = 'y')]
+    yes: bool,
 }
 
 pub async fn land(
@@ -53,26 +60,9 @@ pub async fn land(
     };
 
     // Load Pull Request information
-    let pull_request = gh.clone().get_pull_request(pull_request_number).await?;
+    let pull_request = gh.get_pull_request(pull_request_number).await?;
 
-    if pull_request.state != PullRequestState::Open {
-        return Err(Error::new(formatdoc!(
-            "This Pull Request is already closed!",
-        )));
-    }
-
-    if pull_request.is_draft {
-        return Err(Error::new(format!(
-            "Pull Request #{pull_request_number} is a draft. Mark it ready for review \
-             first (for example with `gh pr ready {pull_request_number}`)."
-        )));
-    }
-
-    if config.require_approval && pull_request.review_decision != ReviewDecision::Approved {
-        return Err(Error::new(
-            "This Pull Request has not been approved on GitHub.",
-        ));
-    }
+    check_landable(config, &pull_request)?;
 
     output("🛫", "Getting started...")?;
 
@@ -109,38 +99,58 @@ pub async fn land(
     // cherry-picked the commit onto master.
     let pr_head_oid = pull_request.head_oid;
 
-    // A Pull Request in a native GitHub stack can only be merged from the
-    // bottom of the stack, and only through GitHub's stack-aware merge.
-    let stack = match gh.list_stacks().await {
-        Ok(Some(stacks)) => stacks
-            .into_iter()
-            .find(|stack| stack.active_pull_requests().contains(&pull_request_number)),
-        _ => None,
-    };
+    // A Pull Request in a native GitHub stack is merged through GitHub's
+    // stack-aware merge, which merges every Pull Request below it too.
+    let stack = gh
+        .stack_containing(pull_request_number)
+        .await
+        .ok()
+        .flatten();
+    // The Pull Requests below this one that merge with it, bottom first.
+    let mut merged_below = Vec::new();
     if let Some(stack) = &stack {
-        let active = stack.active_pull_requests();
-        if active.first() != Some(&pull_request_number) || !base_is_master {
+        let below = stack
+            .active_pull_requests()
+            .into_iter()
+            .take_while(|n| *n != pull_request_number)
+            .map(Some);
+        for pr in gh.get_pull_requests(below).await?.into_iter().flatten() {
+            check_landable(config, &pr)?;
+            merged_below.push(pr);
+        }
+        let bottom = merged_below.first().unwrap_or(&pull_request);
+        if !bottom.base.is_master_branch() {
             return Err(Error::new(format!(
-                "Pull Request #{} is not at the bottom of GitHub stack #{}. \
-                 Land {} first.",
-                pull_request_number,
+                "GitHub stack #{} targets {}, not {}.",
                 stack.number,
-                crate::stacks::format_pr_list(
-                    &active
-                        .iter()
-                        .copied()
-                        .take_while(|n| *n != pull_request_number)
-                        .collect::<Vec<_>>()
-                ),
+                bottom.base.branch_name(),
+                config.master_ref.branch_name()
             )));
         }
-        output(
-            "🧱",
-            &format!("Merging from the bottom of GitHub stack #{}", stack.number),
-        )?;
+
+        if merged_below.is_empty() {
+            output(
+                "🧱",
+                &format!("Merging from the bottom of GitHub stack #{}", stack.number),
+            )?;
+        } else {
+            let below: Vec<u64> = merged_below.iter().map(|pr| pr.number).collect();
+            let mut merging = below.clone();
+            merging.push(pull_request_number);
+            output(
+                "🧱",
+                &format!(
+                    "Landing #{} merges {} from GitHub stack #{} (bottom first)",
+                    pull_request_number,
+                    crate::stacks::format_pr_list(&merging),
+                    stack.number
+                ),
+            )?;
+            confirm_merging_below(&opts, &below)?;
+        }
     }
 
-    if !base_is_master {
+    if !base_is_master && stack.is_none() {
         // The base of the Pull Request on GitHub is not set to master. This
         // means the Pull Request uses a base branch. We tested above that
         // merging the Pull Request branch into the master branch produces the
@@ -205,7 +215,10 @@ pub async fn land(
             )));
         }
 
-        if mergeability.base.is_master_branch() && mergeability.mergeable.is_some() {
+        // A stacked Pull Request keeps its base; the stack merge lands it.
+        if (mergeability.base.is_master_branch() || stack.is_some())
+            && mergeability.mergeable.is_some()
+        {
             if mergeability.mergeable != Some(true) {
                 break Err(Error::new(formatdoc!(
                     "GitHub concluded the Pull Request is not mergeable at \
@@ -282,7 +295,7 @@ pub async fn land(
 
             // If we changed the target branch of the Pull Request earlier, then
             // undo this change now.
-            if !base_is_master {
+            if !base_is_master && stack.is_none() {
                 let result = gh
                     .update_pull_request(
                         pull_request_number,
@@ -303,15 +316,35 @@ pub async fn land(
 
     output("🛬", "Landed!")?;
 
-    // Other open Pull Requests may target this Pull Request's branch (natively
-    // stacked PRs do). GitHub closes a Pull Request whose base branch is
-    // deleted, so move them to master first, and keep any branch that another
-    // open Pull Request still uses.
-    let open_pull_requests = gh.get_open_pull_requests().await.unwrap_or_default();
-    let mut keep_head_branch = false;
-    for dependent in open_pull_requests.iter().filter(|pr| {
-        pr.number != pull_request_number && pr.base_ref_name == pull_request.head.branch_name()
-    }) {
+    // Other open Pull Requests may target a merged Pull Request's branch
+    // (natively stacked PRs do). GitHub closes a Pull Request whose base
+    // branch is deleted, so move them to master first, and keep any branch
+    // that another open Pull Request still uses.
+    let merged_heads: Vec<&crate::github::GitHubBranch> = merged_below
+        .iter()
+        .map(|pr| &pr.head)
+        .chain([&pull_request.head])
+        .collect();
+    let merged_numbers: Vec<u64> = merged_below
+        .iter()
+        .map(|pr| pr.number)
+        .chain([pull_request_number])
+        .collect();
+    let open_pull_requests: Vec<_> = gh
+        .get_open_pull_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pr| !merged_numbers.contains(&pr.number))
+        .collect();
+    let mut kept_heads = Vec::new();
+    for dependent in open_pull_requests.iter() {
+        let Some(head) = merged_heads
+            .iter()
+            .find(|head| dependent.base_ref_name == head.branch_name())
+        else {
+            continue;
+        };
         let retarget = gh
             .update_pull_request(
                 dependent.number,
@@ -331,57 +364,48 @@ pub async fn land(
                 ),
             )?,
             Err(_) => {
-                keep_head_branch = true;
+                kept_heads.push(head.branch_name().to_string());
                 output(
                     "⚠️",
                     &format!(
                         "Pull Request #{} still targets {}; keeping that branch",
                         dependent.number,
-                        pull_request.head.branch_name()
+                        head.branch_name()
                     ),
                 )?;
             }
         }
     }
-    let base_used_elsewhere = open_pull_requests.iter().any(|pr| {
-        pr.number != pull_request_number
-            && (pr.head_ref_name == pull_request.base.branch_name()
-                || pr.base_ref_name == pull_request.base.branch_name())
-    });
+    let used_elsewhere = |branch: &str| {
+        open_pull_requests
+            .iter()
+            .any(|pr| pr.head_ref_name == branch || pr.base_ref_name == branch)
+    };
 
-    let remove_old_branch_child_process = if keep_head_branch {
-        None
-    } else {
-        Some(
+    let mut branches_to_delete: Vec<&crate::github::GitHubBranch> = merged_heads
+        .iter()
+        .copied()
+        .filter(|head| !kept_heads.iter().any(|kept| kept == head.branch_name()))
+        .collect();
+    if !base_is_master && stack.is_none() && !used_elsewhere(pull_request.base.branch_name()) {
+        branches_to_delete.push(&pull_request.base);
+    }
+    let mut delete_branch_processes = Vec::new();
+    for branch in branches_to_delete {
+        delete_branch_processes.push((
+            branch.branch_name().to_string(),
             jj.git_command()
                 .arg("push")
                 .arg("--no-verify")
                 .arg("--delete")
                 .arg("--")
                 .arg(&config.remote_name)
-                .arg(pull_request.head.on_github())
+                .arg(branch.on_github())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()?,
-        )
-    };
-
-    let remove_old_base_branch_child_process = if base_is_master || base_used_elsewhere {
-        None
-    } else {
-        Some(
-            jj.git_command()
-                .arg("push")
-                .arg("--no-verify")
-                .arg("--delete")
-                .arg("--")
-                .arg(&config.remote_name)
-                .arg(pull_request.base.on_github())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        )
-    };
+        ));
+    }
 
     // Rebase us on top of the now-landed commit
     if let Some(sha) = merged_sha {
@@ -415,15 +439,78 @@ pub async fn land(
         )?;
     }
 
-    // Wait for the "git push" to delete the old Pull Request branch to finish,
-    // but ignore the result. GitHub may be configured to delete the branch
-    // automatically, in which case it's gone already and this command fails.
-    if let Some(mut proc) = remove_old_branch_child_process {
-        proc.wait().await?;
-    }
-    if let Some(mut proc) = remove_old_base_branch_child_process {
-        proc.wait().await?;
+    // Wait for the "git push" deleting the old branches to finish. GitHub may
+    // be configured to delete the branch automatically, in which case it's
+    // gone already and the push fails harmlessly; report any other failure.
+    for (branch, proc) in delete_branch_processes {
+        let result = proc.wait_with_output().await?;
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        if !result.status.success() && !stderr.contains("remote ref does not exist") {
+            output(
+                "⚠️",
+                &format!(
+                    "Could not delete branch {branch}: {}",
+                    stderr
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            )?;
+        }
     }
 
     Ok(())
+}
+
+/// Refuse Pull Requests that GitHub would not merge, or that are not
+/// approved when approval is required.
+fn check_landable(
+    config: &crate::config::Config,
+    pull_request: &crate::github::PullRequest,
+) -> Result<()> {
+    let number = pull_request.number;
+    if pull_request.state != PullRequestState::Open {
+        return Err(Error::new(format!(
+            "Pull Request #{number} is already closed!"
+        )));
+    }
+    if pull_request.is_draft {
+        return Err(Error::new(format!(
+            "Pull Request #{number} is a draft. Mark it ready for review first (for \
+             example with `gh pr ready {number}`)."
+        )));
+    }
+    if config.require_approval && pull_request.review_decision != ReviewDecision::Approved {
+        return Err(Error::new(format!(
+            "Pull Request #{number} has not been approved on GitHub."
+        )));
+    }
+    Ok(())
+}
+
+/// Landing a Pull Request above the bottom of a stack merges the ones below
+/// it too; make sure that is intended.
+fn confirm_merging_below(opts: &LandOptions, below: &[u64]) -> Result<()> {
+    use std::io::IsTerminal;
+    if opts.yes {
+        return Ok(());
+    }
+    let list = crate::stacks::format_pr_list(below);
+    if !std::io::stdin().is_terminal() {
+        return Err(Error::new(format!(
+            "This would also merge {list}. Pass --yes to confirm, or land the bottom \
+             of the stack first."
+        )));
+    }
+    let confirmed = dialoguer::Confirm::new()
+        .with_prompt(format!("Also merge {list}?"))
+        .default(false)
+        .interact()?;
+    if confirmed {
+        Ok(())
+    } else {
+        Err(Error::new("Not landing anything."))
+    }
 }

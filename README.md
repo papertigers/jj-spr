@@ -141,7 +141,7 @@ jj spr land -r @-              # Land the PR
 
 # Stacked PRs (dependent)
 jj spr diff --all              # Create PRs for all changes
-jj spr land -r <change-id>     # Land bottom of stack
+jj spr land -r <change-id>     # Land it (native stacks: and the PRs below it)
 
 # Independent PRs
 jj spr diff --cherry-pick      # Create independent PR
