@@ -107,24 +107,10 @@ pub async fn spr() -> Result<()> {
     let git_config = jj.git_repo.config()?;
 
     // Try to get config from jj first, fall back to git config
-    let github_repository = match cli.github_repository {
-        Some(v) => Ok(v),
-        None => {
-            // Try jj config first
-            if let Ok(output) = std::process::Command::new("jj")
-                .args(["config", "get", "spr.githubRepository"])
-                .output()
-            {
-                if output.status.success() {
-                    Ok(String::from_utf8(output.stdout)?.trim().to_string())
-                } else {
-                    git_config.get_string("spr.githubRepository")
-                }
-            } else {
-                git_config.get_string("spr.githubRepository")
-            }
-        }
-    }?;
+    let github_repository = cli
+        .github_repository
+        .or_else(|| get_config_value("spr.githubRepository", &git_config))
+        .ok_or_else(|| Error::new("spr.githubRepository is not configured"))?;
 
     let (github_owner, github_repo) = {
         let captures = lazy_regex::regex!(r#"^([\w\-\.]+)/([\w\-\.]+)$"#)
