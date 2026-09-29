@@ -12,7 +12,7 @@
 //! base of a stacked Pull Request) and which stacks to create or extend
 //! afterwards. Keeping this logic free of I/O lets it be unit tested.
 
-use crate::github::GitHubStack;
+use crate::github::{GitHubStack, ReviewDecision};
 
 /// One Pull Request in the selection, in local parent order (bottom first),
 /// as it is about to be published.
@@ -236,6 +236,12 @@ pub struct ReviewedPullRequest {
     pub draft: bool,
     pub base: String,
     pub head: String,
+    pub review: ReviewDecision,
+    /// Names of the CI checks on the head that failed, and that have not
+    /// finished yet.
+    pub failing_checks: Vec<String>,
+    pub pending_checks: Vec<String>,
+    pub unresolved_threads: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +263,17 @@ pub enum Finding {
     Draft {
         number: u64,
     },
+    FailingChecks {
+        number: u64,
+        checks: Vec<String>,
+    },
+    ChangesRequested {
+        number: u64,
+    },
+    UnresolvedThreads {
+        number: u64,
+        count: usize,
+    },
     Merged {
         number: u64,
     },
@@ -276,6 +293,40 @@ pub enum Finding {
 }
 
 impl Finding {
+    /// A stable name for the kind of finding, for `jj spr stack --json`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Finding::NotSubmitted { .. } => "not_submitted",
+            Finding::OutOfDate { .. } => "needs_update",
+            Finding::Draft { .. } => "draft",
+            Finding::FailingChecks { .. } => "failing_checks",
+            Finding::ChangesRequested { .. } => "changes_requested",
+            Finding::UnresolvedThreads { .. } => "unresolved_threads",
+            Finding::Merged { .. } => "merged",
+            Finding::Closed { .. } => "closed",
+            Finding::WrongBase { .. } => "wrong_base",
+            Finding::Stack(StackAction::Create(_)) => "stack_missing",
+            Finding::Stack(StackAction::Add { .. }) => "stack_incomplete",
+            Finding::Stack(StackAction::Warn(_)) => "stack_mismatch",
+            Finding::StacksUnavailable => "stacks_unavailable",
+        }
+    }
+
+    /// The Pull Request the finding is about, if it is about one.
+    pub fn pull_request(&self) -> Option<u64> {
+        match self {
+            Finding::OutOfDate { number }
+            | Finding::Draft { number }
+            | Finding::FailingChecks { number, .. }
+            | Finding::ChangesRequested { number }
+            | Finding::UnresolvedThreads { number, .. }
+            | Finding::Merged { number }
+            | Finding::Closed { number }
+            | Finding::WrongBase { number, .. } => Some(*number),
+            _ => None,
+        }
+    }
+
     pub fn message(&self) -> String {
         match self {
             Finding::NotSubmitted { change } => {
@@ -287,6 +338,16 @@ impl Finding {
             ),
             Finding::Draft { number } => format!(
                 "#{number} is a draft. Mark it ready for review on GitHub before landing it."
+            ),
+            Finding::FailingChecks { number, checks } => {
+                format!("#{number} has failing checks: {}.", checks.join(", "))
+            }
+            Finding::ChangesRequested { number } => {
+                format!("#{number} has changes requested.")
+            }
+            Finding::UnresolvedThreads { number, count } => format!(
+                "#{number} has {count} unresolved review thread{}.",
+                if *count == 1 { "" } else { "s" }
             ),
             Finding::Merged { number } => format!(
                 "#{number} has merged. Run `jj spr sync` to abandon it locally and \
@@ -375,6 +436,21 @@ pub fn review_stack(
         if pr.draft {
             findings.push(Finding::Draft { number: pr.number });
         }
+        if !pr.failing_checks.is_empty() {
+            findings.push(Finding::FailingChecks {
+                number: pr.number,
+                checks: pr.failing_checks.clone(),
+            });
+        }
+        if pr.review == ReviewDecision::ChangesRequested {
+            findings.push(Finding::ChangesRequested { number: pr.number });
+        }
+        if pr.unresolved_threads > 0 {
+            findings.push(Finding::UnresolvedThreads {
+                number: pr.number,
+                count: pr.unresolved_threads,
+            });
+        }
         if native {
             // The first change sits on master, as does a cherry-pick; any other
             // change targets the Pull Request of the change below it.
@@ -427,6 +503,35 @@ pub fn review_stack(
     findings
 }
 
+/// How many changes, from the bottom of the stack, are ready to land:
+/// submitted and up to date, open, not drafts, with passing (or no) checks,
+/// no unresolved threads, and approved (or not needing approval). Without a
+/// native stack only the bottom change can be landed, so this is at most
+/// one.
+pub fn ready_to_land(changes: &[ReviewedChange], native: bool, require_approval: bool) -> usize {
+    let ready = changes
+        .iter()
+        .take_while(|change| {
+            let Some(pr) = &change.pr else {
+                return false;
+            };
+            let approved = match pr.review {
+                ReviewDecision::Approved => true,
+                ReviewDecision::None => !require_approval,
+                ReviewDecision::ChangesRequested | ReviewDecision::Required => false,
+            };
+            pr.state == ReviewedState::Open
+                && !change.differs_from_pr
+                && !pr.draft
+                && pr.failing_checks.is_empty()
+                && pr.pending_checks.is_empty()
+                && pr.unresolved_threads == 0
+                && approved
+        })
+        .count();
+    if native { ready } else { ready.min(1) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +580,10 @@ mod tests {
                 draft: false,
                 base: base.to_string(),
                 head: head.to_string(),
+                review: ReviewDecision::Approved,
+                failing_checks: vec![],
+                pending_checks: vec![],
+                unresolved_threads: 0,
             }),
             cherry_pick: false,
             differs_from_pr: false,
@@ -740,5 +849,81 @@ mod tests {
         let stacks = [stack(9, &[(2, false), (1, false)])];
         let actions = plan_stack_updates(&stacks, &[vec![1, 2]]);
         assert!(matches!(actions.as_slice(), [StackAction::Warn(_)]));
+    }
+
+    fn pr_mut(change: &mut ReviewedChange) -> &mut ReviewedPullRequest {
+        change.pr.as_mut().unwrap()
+    }
+
+    #[test]
+    fn review_reports_checks_reviews_and_threads() {
+        let mut changes = native_stack();
+        pr_mut(&mut changes[0]).failing_checks = vec!["build".into(), "clippy".into()];
+        pr_mut(&mut changes[1]).review = ReviewDecision::ChangesRequested;
+        pr_mut(&mut changes[2]).unresolved_threads = 2;
+        let findings = review_stack(
+            &changes,
+            Some(&[stack(1, &[(1, false), (2, false), (3, false)])]),
+            true,
+            "main",
+        );
+        assert_eq!(
+            findings,
+            vec![
+                Finding::FailingChecks {
+                    number: 1,
+                    checks: vec!["build".into(), "clippy".into()]
+                },
+                Finding::ChangesRequested { number: 2 },
+                Finding::UnresolvedThreads {
+                    number: 3,
+                    count: 2
+                },
+            ]
+        );
+        assert_eq!(
+            findings[0].message(),
+            "#1 has failing checks: build, clippy."
+        );
+        assert_eq!(findings[2].message(), "#3 has 2 unresolved review threads.");
+    }
+
+    #[test]
+    fn ready_to_land_counts_from_the_bottom() {
+        let mut changes = native_stack();
+        assert_eq!(ready_to_land(&changes, true, true), 3);
+        assert_eq!(
+            ready_to_land(&changes, false, true),
+            1,
+            "only the bottom without native stacks"
+        );
+
+        pr_mut(&mut changes[1]).pending_checks = vec!["build".into()];
+        assert_eq!(ready_to_land(&changes, true, true), 1);
+        pr_mut(&mut changes[0]).unresolved_threads = 1;
+        assert_eq!(ready_to_land(&changes, true, true), 0);
+    }
+
+    #[test]
+    fn ready_to_land_needs_approval_only_when_required() {
+        let mut changes = native_stack();
+        pr_mut(&mut changes[0]).review = ReviewDecision::None;
+        assert_eq!(ready_to_land(&changes, true, true), 0);
+        assert_eq!(ready_to_land(&changes, true, false), 3);
+        pr_mut(&mut changes[0]).review = ReviewDecision::Required;
+        assert_eq!(ready_to_land(&changes, true, false), 0);
+    }
+
+    #[test]
+    fn ready_to_land_skips_stale_drafts_and_unsubmitted() {
+        let mut changes = native_stack();
+        changes[1].differs_from_pr = true;
+        assert_eq!(ready_to_land(&changes, true, true), 1);
+        let mut changes = native_stack();
+        pr_mut(&mut changes[0]).draft = true;
+        assert_eq!(ready_to_land(&changes, true, true), 0);
+        let mut changes = native_stack();
+        changes[0].pr = None;
+        assert_eq!(ready_to_land(&changes, true, true), 0);
     }
 }

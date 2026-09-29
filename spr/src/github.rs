@@ -116,6 +116,35 @@ pub struct UserWithName {
     pub is_collaborator: bool,
 }
 
+/// CI checks and unresolved review threads of a Pull Request.
+#[derive(Debug, Clone, Default)]
+pub struct PullRequestStatus {
+    pub checks: Vec<Check>,
+    pub unresolved_threads: Vec<ReviewThread>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub name: String,
+    pub state: CheckState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    Passed,
+    Failed,
+    Pending,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThread {
+    pub path: String,
+    pub line: Option<i64>,
+    pub author: Option<String>,
+    /// The thread's first comment.
+    pub body: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PullRequestMergeability {
     pub base: GitHubBranch,
@@ -140,6 +169,14 @@ type GitObjectID = String;
     response_derives = "Debug"
 )]
 pub struct PullRequestMergeabilityQuery;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/pullrequest_status_query.graphql",
+    response_derives = "Debug"
+)]
+pub struct PullRequestStatusQuery;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -481,6 +518,95 @@ impl GitHub {
             merge_commit: pr
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),
+        })
+    }
+
+    /// The CI checks on a Pull Request's head and its unresolved review
+    /// threads.
+    pub async fn get_pull_request_status(&self, number: u64) -> Result<PullRequestStatus> {
+        use pull_request_status_query::{
+            CheckConclusionState as Conclusion, CheckStatusState as Status,
+            PullRequestStatusQueryRepositoryPullRequestStatusCheckRollupContextsNodes as Context,
+            StatusState,
+        };
+
+        let variables = pull_request_status_query::Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+            number: number as i64,
+        };
+        let request_body = PullRequestStatusQuery::build_query(variables);
+        let res = self
+            .graphql_client
+            .post(self.config.graphql_url())
+            .json(&request_body)
+            .send()
+            .await?;
+        let response_body: Response<pull_request_status_query::ResponseData> = res.json().await?;
+        if let Some(errors) = response_body.errors {
+            let error = Err(Error::new(format!("querying PR #{number} status failed")));
+            return errors
+                .into_iter()
+                .fold(error, |err, e| err.context(e.to_string()));
+        }
+        let pr = response_body
+            .data
+            .and_then(|data| data.repository)
+            .and_then(|repository| repository.pull_request)
+            .ok_or_else(|| Error::new(format!("failed to find PR #{number}")))?;
+
+        let checks = pr
+            .status_check_rollup
+            .and_then(|rollup| rollup.contexts.nodes)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|context| match context {
+                Context::CheckRun(run) => Check {
+                    name: run.name,
+                    state: match (run.status, run.conclusion) {
+                        (Status::COMPLETED, Some(Conclusion::SUCCESS))
+                        | (Status::COMPLETED, Some(Conclusion::NEUTRAL))
+                        | (Status::COMPLETED, Some(Conclusion::SKIPPED)) => CheckState::Passed,
+                        (Status::COMPLETED, _) => CheckState::Failed,
+                        _ => CheckState::Pending,
+                    },
+                },
+                Context::StatusContext(status) => Check {
+                    name: status.context,
+                    state: match status.state {
+                        StatusState::SUCCESS => CheckState::Passed,
+                        StatusState::PENDING | StatusState::EXPECTED => CheckState::Pending,
+                        _ => CheckState::Failed,
+                    },
+                },
+            })
+            .collect();
+
+        let unresolved_threads = pr
+            .review_threads
+            .nodes
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|thread| !thread.is_resolved)
+            .map(|thread| {
+                let first = thread.comments.nodes.into_iter().flatten().flatten().next();
+                ReviewThread {
+                    path: thread.path,
+                    line: thread.line,
+                    author: first
+                        .as_ref()
+                        .and_then(|c| c.author.as_ref())
+                        .map(|a| a.login.clone()),
+                    body: first.map(|c| c.body).unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        Ok(PullRequestStatus {
+            checks,
+            unresolved_threads,
         })
     }
 
