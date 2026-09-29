@@ -166,3 +166,28 @@ fn diff_refetches_a_rewritten_pr_branch() {
         out.text
     );
 }
+
+#[test]
+fn diff_refuses_colleagues_push_after_github_rebase() {
+    // The live run's sequence: land part of the stack (GitHub rewrites the
+    // remaining branches), sync, resubmit, then a colleague pushes.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    env.spr(&["land", "-r", &changes[1], "--yes"]);
+    env.spr(&["sync"]);
+    env.spr(&["diff", "--all", "-m", "after landing"]);
+    let e = env.commit("Change E", "e.txt", "e\n");
+    env.spr(&["diff", "--all", "-m", "add E"]);
+    env.push_to_pr_branch(prs[2], "c-fix.txt", "fix\n");
+
+    let out = env.try_spr(&["diff", "--all", "-m", "would drop the push"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(
+        out.flat()
+            .contains("commits that are not in the local change"),
+        "{}",
+        out.text
+    );
+    let _ = e;
+}

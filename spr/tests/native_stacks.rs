@@ -325,12 +325,76 @@ fn land_bottom() {
 }
 
 #[test]
-fn land_refuses_middle() {
+fn land_middle_needs_confirmation() {
     let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
     let out = env.try_spr(&["land", "-r", &changes[1]]);
-    assert!(!out.success);
-    assert!(out.flat().contains("not at the bottom"), "{}", out.text);
+    assert!(!out.success, "land should ask first:\n{}", out.text);
+    let text = out.flat();
+    assert!(
+        text.contains(&format!("merges #{}, #{}", prs[0], prs[1])),
+        "{}",
+        out.text
+    );
+    assert!(text.contains("--yes"), "{}", out.text);
+    assert!(
+        env.gh.state().prs.values().all(|pr| pr.merged_at.is_none()),
+        "nothing should merge"
+    );
+}
+
+#[test]
+fn land_middle_merges_stack_below() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c", "d"]);
+    let prs = env.prs_for(&changes);
+    let merged_branches: Vec<String> = prs[..3].iter().map(|&n| env.pr(n).head_ref).collect();
+
+    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    for &n in &prs[..3] {
+        assert!(env.pr(n).merged_at.is_some(), "PR #{n} should be merged");
+    }
+    assert_eq!(
+        env.requests_since(0, "PUT", "merge-async").len(),
+        1,
+        "one stack merge"
+    );
+    let top = env.pr(prs[3]);
+    assert!(
+        top.is_open(),
+        "PR #{} was closed: {:?}",
+        prs[3],
+        top.closed_reason
+    );
+    assert_eq!(
+        top.base_ref, "main",
+        "the rest of the stack now targets main"
+    );
+    for branch in &merged_branches {
+        assert!(env.branch(branch).is_none(), "{branch} should be deleted");
+    }
+
+    env.spr(&["sync"]);
+    assert!(changes[..3].iter().all(|c| !env.is_visible(c)));
+    env.spr(&["diff", "--all", "-m", "after landing"]);
+    assert_eq!(env.pr_files(prs[3]), vec!["d.txt"]);
+}
+
+#[test]
+fn land_middle_checks_stack_below() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().prs.get_mut(&prs[0]).unwrap().draft = true;
+
+    let out = env.try_spr(&["land", "-r", &changes[1], "--yes"]);
+    assert!(!out.success, "land should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains(&format!("#{} is a draft", prs[0])),
+        "{}",
+        out.text
+    );
     assert!(
         env.gh.state().prs.values().all(|pr| pr.merged_at.is_none()),
         "nothing should merge"
@@ -431,4 +495,37 @@ fn github_rebase_after_merge_keeps_edits_in_merge_commits() {
         "C's edit was in a merge commit that GitHub's rebase dropped"
     );
     assert_eq!(env.pr_files(prs[2]), vec!["c.txt"]);
+}
+
+#[test]
+fn land_reports_branch_it_could_not_delete() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    let branch = env.pr(prs[0]).head_ref;
+    let hook = env.root.path().join("remote.git/hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nwhile read old new ref; do\n  case $new in 0000000000000000000000000000000000000000)\n    echo \"deletion of $ref denied\" >&2; exit 1;;\n  esac\ndone\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&hook)
+        .status()
+        .unwrap();
+
+    let out = env.spr(&["land", "-r", &changes[0]]);
+    assert!(
+        out.flat()
+            .contains(&format!("Could not delete branch {branch}")),
+        "{}",
+        out.text
+    );
+    assert!(
+        out.flat().contains("denied"),
+        "git's reason should be shown:\n{}",
+        out.text
+    );
+    assert!(env.branch(&branch).is_some());
 }
