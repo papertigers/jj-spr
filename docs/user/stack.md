@@ -359,6 +359,49 @@ shows what it would do, and `jj undo` reverts a sync.
 
 Afterwards, run `jj spr diff --all` to update the remaining Pull Requests.
 
+### Working on someone else's stack
+
+`jj spr patch <number>` creates local changes from existing Pull Requests.
+If the Pull Request is part of a native GitHub stack, it fetches every open
+Pull Request in the stack, bottom first, whichever one you name:
+
+```
+$ jj spr patch 2
+  🔄  Fetching from origin
+  🧱  #2 is part of a stack: #1, #2, #3 (bottom first)
+  📥  #1: created yuynpkkv Change A
+  📥  #2: created pkmlqutt Change B
+  📥  #3: created yxpnkqnw Change C
+  👉  Working copy is now on top of yxpnkqnw
+```
+
+Each change holds its Pull Request's own diff and a `Pull Request:` trailer,
+so `jj spr diff --all` updates those Pull Requests instead of opening new
+ones. `--no-stack` fetches only the named Pull Request, and `--no-checkout`
+leaves the working copy where it is.
+
+When someone pushes to one of the Pull Requests, run `jj spr patch` again to
+update your changes. Each Pull Request that already has a local change is
+compared with it:
+
+- **up to date:** nothing to do
+- **updated from GitHub:** GitHub has commits the change lacks, and the
+  change has nothing that is not on GitHub
+- **kept:** the change has local edits that are not on GitHub yet, and GitHub
+  has nothing new; `jj spr diff` pushes them
+
+If a change and its Pull Request both have edits the other lacks, it changes
+nothing and says which. Move your edits into a separate change (for example
+with `jj split`) and run it again.
+
+`jj spr diff` never pushes over someone else's commits either. If a Pull
+Request has commits its local change lacks, it stops before pushing anything
+and suggests `jj spr patch`. Your own edits since your last push don't count,
+and neither does GitHub rebasing a stack after a merge. To replace what is on
+GitHub with your version anyway, pass `--discard-remote-changes`. The other
+person's commits stay in the branch's history, but their edits disappear
+from the Pull Request's diff.
+
 ### Best Practices
 
 - ✅ **Always land in order:** Parent → Child → Grandchild
