@@ -291,22 +291,17 @@ async fn status_of(
 ///
 /// Comparing whole trees is not enough: a cherry-picked Pull Request, or one
 /// whose branch was updated from main on GitHub, has a different tree from
-/// the local change even though nothing is unpublished. Instead, apply the
-/// local change's own diff (from its parent to itself) to the published tree
-/// with a three-way merge. If that changes nothing and does not conflict,
-/// the change has nothing that is not already published.
+/// the local change even though nothing is unpublished. Instead, check that
+/// the local change's own diff (from its parent to itself) is already in the
+/// published tree.
 fn already_contains(
     jj: &crate::jj::Jujutsu,
     published: Oid,
     change: &PreparedCommit,
 ) -> Result<bool> {
-    let repo = &jj.git_repo;
-    let ancestor = repo.find_tree(jj.get_tree_oid_for_commit(change.parent_oid)?)?;
-    let ours = repo.find_tree(published)?;
-    let theirs = repo.find_tree(jj.get_tree_oid_for_commit(change.oid)?)?;
-    let mut merged = repo.merge_trees(&ancestor, &ours, &theirs, None)?;
-    if merged.has_conflicts() {
-        return Ok(false);
-    }
-    Ok(merged.write_tree_to(repo)? == published)
+    jj.tree_contains_diff(
+        published,
+        jj.get_tree_oid_for_commit(change.parent_oid)?,
+        jj.get_tree_oid_for_commit(change.oid)?,
+    )
 }

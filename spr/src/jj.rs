@@ -363,6 +363,42 @@ impl Jujutsu {
         self.git_repo.find_commit(commit).ok().map(|c| c.tree_id())
     }
 
+    /// Whether `tree` already contains the changes from `from` to `to` (all
+    /// trees): applying them to `tree` with a three-way merge changes nothing
+    /// and does not conflict. Unlike comparing trees, this still holds when
+    /// `tree` also has other changes, such as a newer main branch.
+    pub fn tree_contains_diff(&self, tree: Oid, from: Oid, to: Oid) -> Result<bool> {
+        let repo = &self.git_repo;
+        let mut merged = repo.merge_trees(
+            &repo.find_tree(from)?,
+            &repo.find_tree(tree)?,
+            &repo.find_tree(to)?,
+            None,
+        )?;
+        if merged.has_conflicts() {
+            return Ok(false);
+        }
+        Ok(merged.write_tree_to(repo)? == tree)
+    }
+
+    /// Every version of the change that `commit` is, newest first, from
+    /// `jj evolog`, leaving out any that are not in the Git repository.
+    pub fn evolog(&self, commit: Oid) -> Result<Vec<Oid>> {
+        let listing = self.run([
+            "evolog",
+            "--no-graph",
+            "-r",
+            &commit.to_string(),
+            "-T",
+            "commit.commit_id() ++ \"\\n\"",
+        ])?;
+        Ok(listing
+            .lines()
+            .filter_map(|line| Oid::from_str(line.trim()).ok())
+            .filter(|oid| self.tree_if_present(*oid).is_some())
+            .collect())
+    }
+
     /// Map each commit to its change ID with one jj invocation.
     pub fn change_ids_for(
         &self,
