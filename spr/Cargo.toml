@@ -36,4 +36,6 @@ tokio = { version = "^1.19.2", features = ["macros", "process", "rt-multi-thread
 unicode-normalization = "^0.1.19"
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+tokio = { version = "^1.19.2", features = ["net", "sync"] }
 tempfile = "3.0"
