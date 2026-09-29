@@ -1,9 +1,7 @@
 //! A fake GitHub API for testing jj-spr's native stack support.
 //!
-//! This is a Rust port of `tests/native_stacks/fake_github.py`; keep the two
-//! in step. It serves the REST and GraphQL calls jj-spr makes, backed by a bare
-//! Git repository that jj-spr pushes to, and models GitHub's stacked pull
-//! requests.
+//! It serves the REST and GraphQL calls jj-spr makes, backed by a bare Git
+//! repository that jj-spr pushes to, and models GitHub's stacked pull requests.
 //!
 //! The stack behaviour follows the fake GitHub in jj-stack
 //! (<https://github.com/bos/jj-stack>, `tests/support/fake_github.py`,
@@ -17,13 +15,21 @@
 //!   it, and GitHub then rebases the remaining members onto the new base
 //! - merged members stay listed in the stack as history
 //!
-//! Behaviour that is an assumption of this fake rather than observed:
+//! Checked against real GitHub with `tests/live/run_live_github.sh`:
 //!
-//! - the ordinary merge endpoint refuses stacked PRs
-//! - the post-merge rebase replays each surviving PR's net diff as one commit
+//! - stacks are numbered from the same sequence as pull requests and issues
+//! - the ordinary merge endpoint refuses stacked PRs (403), and so does
+//!   "update branch" (403)
+//! - after a stacked merge, GitHub rewrites the branches of the remaining
+//!   members: it replays each of their commits onto the new base, keeping
+//!   message and author, and drops merge commits
+//! - a draft cannot be merged: 405 from the ordinary endpoint, and a failed
+//!   merge (400) from `merge-async`
+//! - a PR in the middle of a stack can be closed; the stack still lists it
 //!
 //! Everything else (closing PRs when their base or head branch is deleted,
-//! squash merges as a three-way merge) is ordinary GitHub behaviour.
+//! squash merges as a three-way merge, "update branch" merging the base into
+//! an ordinary PR) is ordinary GitHub behaviour.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -95,8 +101,8 @@ pub struct State {
     pub stacks: BTreeMap<u64, Vec<u64>>,
     merge_ops: HashMap<u64, MergeOperation>,
     pub requests: Vec<Recorded>,
+    /// Pull requests and stacks share one sequence of numbers, as on GitHub.
     next_number: u64,
-    next_stack: u64,
 }
 
 struct ApiError {
@@ -153,6 +159,34 @@ impl State {
             .arg(&self.git_dir)
             .args(args)
             .envs(GIT_IDENTITY)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "fake github: git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Like `git`, but with the author taken from `commit`.
+    fn git_as_author_of(&self, commit: &str, args: &[&str]) -> String {
+        let author = self.git(&["log", "-1", "--format=%an%x00%ae%x00%aI", commit]);
+        let mut fields = author.split('\0');
+        let (name, email, date) = (
+            fields.next().unwrap_or_default().to_string(),
+            fields.next().unwrap_or_default().to_string(),
+            fields.next().unwrap_or_default().to_string(),
+        );
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .args(args)
+            .envs(GIT_IDENTITY)
+            .env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_AUTHOR_DATE", date)
             .stdin(Stdio::null())
             .output()
             .expect("failed to run git");
@@ -311,13 +345,20 @@ impl State {
                 json!({
                     "number": n,
                     "state": pr.state,
+                    "draft": pr.draft,
                     "merged_at": pr.merged_at,
                     "head": {"ref": pr.head_ref,
                              "sha": heads.get(&pr.head_ref).unwrap_or(&pr.last_head_sha)},
                 })
             })
             .collect();
-        json!({"number": number, "pull_requests": members})
+        let base = self.stacks[&number]
+            .first()
+            .map(|n| self.prs[n].base_ref.clone())
+            .unwrap_or_default();
+        let open = self.stacks[&number].iter().any(|n| self.prs[n].is_open());
+        json!({"id": 1_000_000 + number, "number": number, "base": {"ref": base},
+               "open": open, "pull_requests": members})
     }
 
     fn graphql_pr(&self, number: u64) -> Value {
@@ -385,8 +426,8 @@ impl State {
             return api_error(422, "A stack requires two pull requests.");
         }
         self.validate_stack(&members, &members, None)?;
-        let number = self.next_stack;
-        self.next_stack += 1;
+        let number = self.next_number;
+        self.next_number += 1;
         self.stacks.insert(number, members);
         Ok(self.stack_payload(number))
     }
@@ -446,23 +487,29 @@ impl State {
         commit
     }
 
-    /// GitHub rebasing a surviving stack member after a merge below it.
+    /// GitHub rebasing a surviving stack member after a merge below it:
+    /// each of the branch's own commits (those not in `old_base`) is
+    /// replayed onto the new base, and merge commits are dropped.
     fn rebase_onto(&mut self, number: u64, old_base: &str, new_base_ref: &str) {
         let heads = self.branches();
-        let (head_ref, title) = {
-            let pr = &self.prs[&number];
-            (pr.head_ref.clone(), pr.title.clone())
-        };
-        let new_base = heads[new_base_ref].clone();
+        let head_ref = self.prs[&number].head_ref.clone();
         let head = heads[&head_ref].clone();
-        let merge_base = format!("--merge-base={old_base}");
-        let tree = self.git(&["merge-tree", "--write-tree", &merge_base, &new_base, &head]);
-        let tree = tree.lines().next().unwrap().to_string();
-        let commit = self.git(&["commit-tree", &tree, "-p", &new_base, "-m", &title]);
-        self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &commit]);
+        let mut tip = heads[new_base_ref].clone();
+        let range = format!("{old_base}..{head}");
+        let commits = self.git(&["rev-list", "--reverse", "--no-merges", &range]);
+        for commit in commits.lines() {
+            let parent = format!("{commit}^");
+            let merge_base = format!("--merge-base={parent}");
+            let tree = self.git(&["merge-tree", "--write-tree", &merge_base, &tip, commit]);
+            let tree = tree.lines().next().unwrap().to_string();
+            let message = self.git(&["log", "-1", "--format=%B", commit]);
+            tip =
+                self.git_as_author_of(commit, &["commit-tree", &tree, "-p", &tip, "-m", &message]);
+        }
+        self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &tip]);
         let pr = self.prs.get_mut(&number).unwrap();
         pr.base_ref = new_base_ref.to_string();
-        pr.last_head_sha = commit;
+        pr.last_head_sha = tip;
     }
 
     fn complete_stack_merge(&mut self, pr_number: u64) {
@@ -505,6 +552,31 @@ impl State {
                 "uuid": op.uuid,
             },
         })
+    }
+
+    /// "Update branch": merge the base branch into an ordinary PR's branch.
+    pub fn update_branch(&mut self, number: u64) {
+        let heads = self.branches();
+        let (base_ref, head_ref) = {
+            let pr = &self.prs[&number];
+            (pr.base_ref.clone(), pr.head_ref.clone())
+        };
+        let (base, head) = (heads[&base_ref].clone(), heads[&head_ref].clone());
+        let tree = self.git(&["merge-tree", "--write-tree", &head, &base]);
+        let tree = tree.lines().next().unwrap().to_string();
+        let message = format!("Merge branch '{base_ref}' into {head_ref}");
+        let commit = self.git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-p",
+            &base,
+            "-m",
+            &message,
+        ]);
+        self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &commit]);
+        self.prs.get_mut(&number).unwrap().last_head_sha = commit;
     }
 
     // -- routing -----------------------------------------------------------
@@ -576,7 +648,11 @@ impl State {
                 let n = parse_number(n)?;
                 let head_ref = self.pr_mut(n)?.head_ref.clone();
                 if self.stack_of(n).is_some() {
-                    return api_error(405, "Stacked pull requests must be merged as a stack.");
+                    return api_error(
+                        403,
+                        "Merging stacked PRs via this endpoint is not supported. Use the \
+                         asynchronous merge endpoint instead.",
+                    );
                 }
                 if let Some(sha) = body["sha"].as_str()
                     && self.branches().get(&head_ref).map(String::as_str) != Some(sha)
@@ -607,7 +683,14 @@ impl State {
                     Some(stack) => self.active(&self.stacks[&stack].clone()),
                     None => vec![n],
                 };
-                if !active.contains(&n) || draft {
+                if draft {
+                    return Ok((
+                        400,
+                        Some(json!({"status": "failed",
+                                    "details": {"message": "Pull request is in draft."}})),
+                    ));
+                }
+                if !active.contains(&n) {
                     return api_error(400, "Target is not mergeable.");
                 }
                 let op = MergeOperation {
@@ -622,6 +705,22 @@ impl State {
                 let payload = Self::merge_payload(&op);
                 self.merge_ops.insert(n, op);
                 Ok((202, Some(payload)))
+            }
+            ("PUT", ["pulls", n, "update-branch"]) => {
+                let n = parse_number(n)?;
+                self.pr_mut(n)?;
+                if self.stack_of(n).is_some() {
+                    return api_error(
+                        403,
+                        "Updating a stacked PR's branch via this endpoint is not supported.",
+                    );
+                }
+                self.update_branch(n);
+                Ok((
+                    202,
+                    Some(json!({"message": "Updating pull request branch.",
+                                "url": self.web(&format!("/pull/{n}"))})),
+                ))
             }
             ("GET", ["pulls", n, "merge-async", uuid]) => {
                 let n = parse_number(n)?;
@@ -807,7 +906,6 @@ impl FakeGitHub {
             merge_ops: HashMap::new(),
             requests: Vec::new(),
             next_number: 1,
-            next_stack: 1,
         }));
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake github");
@@ -864,7 +962,7 @@ impl Drop for FakeGitHub {
     }
 }
 
-/// Every request goes through `State::route`, mirroring the Python fake.
+/// Every request goes through `State::route`.
 async fn handle(
     axum::extract::State(state): axum::extract::State<Arc<Mutex<State>>>,
     method: Method,
