@@ -239,3 +239,188 @@ fn stack_legacy_base_branches() {
     let out = env.spr(&["stack"]);
     assert!(out.flat().contains("#2 targets spr/main."), "{}", out.text);
 }
+
+/// A stack of three with passing, running and failing checks, one approval
+/// and one unresolved thread on the top PR.
+fn stack_with_status(env: &TestEnv) -> (Vec<String>, Vec<u64>) {
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let mut gh = env.gh.state();
+    gh.set_checks(prs[0], &[("build", "success"), ("clippy", "success")]);
+    gh.set_checks(prs[1], &[("build", "pending"), ("clippy", "success")]);
+    gh.set_checks(prs[2], &[("build", "failure"), ("clippy", "success")]);
+    gh.review(prs[0], "alice", "APPROVED");
+    gh.review(prs[2], "bob", "CHANGES_REQUESTED");
+    gh.add_thread(prs[2], "c.txt", 1, "bob", "Please rename this\nand more");
+    drop(gh);
+    (changes, prs)
+}
+
+#[test]
+fn stack_shows_checks_and_reviews() {
+    let env = TestEnv::new();
+    let (changes, prs) = stack_with_status(&env);
+    let out = env.spr(&["stack"]);
+
+    assert!(
+        line_for(&out.text, &changes[0]).contains("CI ✓  approved"),
+        "{}",
+        out.text
+    );
+    assert!(
+        line_for(&out.text, &changes[1]).contains("CI ●  no review"),
+        "{}",
+        out.text
+    );
+    assert!(
+        line_for(&out.text, &changes[2]).contains("CI ✗  changes requested, 1 thread"),
+        "{}",
+        out.text
+    );
+    let text = out.flat();
+    assert!(
+        text.contains(&format!("#{} has failing checks: build.", prs[2])),
+        "{}",
+        out.text
+    );
+    assert!(
+        text.contains(&format!("#{} has changes requested.", prs[2])),
+        "{}",
+        out.text
+    );
+    assert!(
+        text.contains(&format!("#{} has 1 unresolved review thread.", prs[2])),
+        "{}",
+        out.text
+    );
+    assert!(
+        text.contains(&format!(
+            "#{} is ready to land: `jj spr land -r {}`",
+            prs[0],
+            &changes[0][..8]
+        )),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn stack_ready_to_land_several() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let mut gh = env.gh.state();
+    gh.set_checks(prs[0], &[("build", "success")]);
+    gh.set_checks(prs[1], &[("build", "success")]);
+    gh.set_checks(prs[2], &[("build", "failure")]);
+    drop(gh);
+
+    let out = env.spr(&["stack"]);
+    assert!(
+        out.flat().contains(&format!(
+            "#{}, #{} are ready to land: `jj spr land -r {}`",
+            prs[0],
+            prs[1],
+            &changes[1][..8]
+        )),
+        "{}",
+        out.text
+    );
+
+    // Approval counts once it is required.
+    env.jj(&["config", "set", "--repo", "spr.requireApproval", "true"]);
+    let out = env.spr(&["stack"]);
+    assert!(!out.text.contains("ready to land"), "{}", out.text);
+}
+
+#[test]
+fn stack_checks_belong_to_the_head() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().set_checks(prs[0], &[("build", "success")]);
+    assert!(line_for(&env.spr(&["stack"]).text, &changes[0]).contains("CI ✓"));
+
+    std::fs::write(env.work.join("a.txt"), "a, edited\n").unwrap();
+    env.jj(&["squash", "--into", &changes[0]]);
+    env.spr(&["diff", "--all", "-m", "edit"]);
+    let out = env.spr(&["stack"]);
+    assert!(
+        line_for(&out.text, &changes[0]).contains("CI -"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn stack_verbose_details() {
+    let env = TestEnv::new();
+    let (changes, _) = stack_with_status(&env);
+    let out = env.spr(&["stack", "-v"]);
+    for change in &changes {
+        let line = line_for(&out.text, change);
+        assert!(
+            !line.contains("CI ") && !line.contains("approved") && !line.contains("review"),
+            "checks and review belong under the row with -v: {line}"
+        );
+        assert!(line.contains("→ "), "{line}");
+    }
+    for expected in [
+        "│    checks   ✓ build   ✓ clippy",
+        "│    checks   ● build   ✓ clippy",
+        "│    checks   ✗ build   ✓ clippy",
+        "│    review   approved by @alice\n",
+        "│    review   changes requested by @bob\n",
+        "│    review   no review\n",
+        "│    threads  ▸ c.txt:1  @bob  \"Please rename this\"",
+    ] {
+        assert!(
+            out.text.contains(expected),
+            "missing {expected:?}:\n{}",
+            out.text
+        );
+    }
+}
+
+#[test]
+fn stack_json() {
+    let env = TestEnv::new();
+    let (changes, prs) = stack_with_status(&env);
+    let out = env.spr(&["stack", "--json"]);
+    let json: serde_json::Value =
+        serde_json::from_str(&out.text).unwrap_or_else(|e| panic!("not JSON ({e}):\n{}", out.text));
+
+    assert_eq!(json["trunk"], "main@origin");
+    assert_eq!(
+        json["github_stacks"][0]["pull_requests"],
+        serde_json::json!(prs)
+    );
+    let entries = json["changes"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["change_id"], changes[0], "bottom first");
+    let bottom = &entries[0]["pull_request"];
+    assert_eq!(bottom["number"], prs[0]);
+    assert_eq!(bottom["review"]["decision"], "approved");
+    assert_eq!(
+        bottom["review"]["approved_by"],
+        serde_json::json!(["alice"])
+    );
+    assert_eq!(bottom["status"]["checks"]["state"], "success");
+    let top = &entries[2]["pull_request"];
+    assert_eq!(
+        top["status"]["checks"]["failing"],
+        serde_json::json!(["build"])
+    );
+    assert_eq!(top["status"]["unresolved_threads"][0]["path"], "c.txt");
+    let kinds: Vec<&str> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["failing_checks", "changes_requested", "unresolved_threads"]
+    );
+    assert_eq!(json["ready_to_land"], serde_json::json!([prs[0]]));
+}

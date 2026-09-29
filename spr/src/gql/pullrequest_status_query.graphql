@@ -1,0 +1,38 @@
+query PullRequestStatusQuery($name: String!, $owner: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      statusCheckRollup {
+        contexts(first: 100) {
+          nodes {
+            __typename
+            ... on CheckRun {
+              name
+              status
+              conclusion
+            }
+            ... on StatusContext {
+              context
+              state
+            }
+          }
+        }
+      }
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          path
+          line
+          comments(first: 1) {
+            nodes {
+              author {
+                __typename
+                login
+              }
+              body
+            }
+          }
+        }
+      }
+    }
+  }
+}

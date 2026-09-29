@@ -529,3 +529,23 @@ fn land_reports_branch_it_could_not_delete() {
     );
     assert!(env.branch(&branch).is_some());
 }
+
+#[test]
+fn land_refuses_when_github_requires_a_review() {
+    // Even with spr.requireApproval off, GitHub itself refuses to merge a
+    // Pull Request whose review decision is not satisfied; stop early.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().review(prs[0], "bob", "CHANGES_REQUESTED");
+
+    let out = env.try_spr(&["land", "-r", &changes[0]]);
+    assert!(!out.success, "land should refuse:\n{}", out.text);
+    assert!(
+        out.flat()
+            .contains(&format!("#{} has changes requested", prs[0])),
+        "{}",
+        out.text
+    );
+    assert!(env.pr(prs[0]).is_open());
+}
