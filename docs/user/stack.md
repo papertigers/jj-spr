@@ -318,27 +318,53 @@ Before landing:
 ### Checking a stack
 
 `jj spr stack` shows the local stack (top first, like `jj log`) next to each
-change's Pull Request, its state and its base branch, and the GitHub stack
-they belong to:
+change's Pull Request: its state, CI checks, review and base branch, and the
+GitHub stack they belong to:
 
 ```
   🧱  GitHub stack #1: #1, #2, #3 (bottom first)
-○  ryxopsnk  Change C  #3  open, needs update  → spr/change-b
-○  ywpvrkrt  Change X  #4  open                → spr/change-b
-○  nrlzpwsu  Change B  #2  open                → spr/change-a
-○  xrrqyttw  Change A  #1  open                → main
+○  ryxopsnk  Change C  #3  open, needs update  CI ✗  changes requested, 1 thread  → spr/change-b
+○  nrlzpwsu  Change B  #2  open                CI ●  no review                    → spr/change-a
+○  xrrqyttw  Change A  #1  open                CI ✓  approved                     → main
 ◆  main@origin
 
   ⚠️  The local change for #3 differs from the Pull Request. Run `jj
       spr diff --all` to update it.
-  ⚠️  #3 targets spr/change-b, but the change below it is #4
-      (spr/change-x). Run `jj spr diff --all` to restack it.
+  ⚠️  #3 has failing checks: build.
+  ⚠️  #3 has changes requested.
+  ⚠️  #3 has 1 unresolved review thread.
+  🛬  #1 is ready to land: `jj spr land -r xrrqyttw`
 ```
+
+`CI ✓` means every check passed, `✗` that one failed, `●` that some are still
+running, and `-` that there are none. Checks belong to a Pull Request's
+current head, so they reset when you push.
 
 It points out anything that does not match, with the command that fixes it:
 changes without a Pull Request, local changes that differ from their Pull
-Request, drafts, merged or closed Pull Requests, and, for native stacks, Pull
-Requests that target the wrong branch or are missing from the GitHub stack.
+Request, drafts, failing checks, requested changes, unresolved review threads,
+merged or closed Pull Requests, and, for native stacks, Pull Requests that
+target the wrong branch or are missing from the GitHub stack. The last line
+names the Pull Requests, from the bottom of the stack up, that are ready to
+land: up to date, not drafts, checks passed, no unresolved threads, and
+approved (if `spr.requireApproval` is set, or the repository requires
+reviews). In a native stack, landing the top one of those lands them all.
+
+`-v` replaces the CI and review columns with lines under each Pull Request:
+its checks by name, who approved or requested changes, who has yet to review,
+and the unresolved threads:
+
+```
+○  ryxopsnk  Change C  #3  open  → spr/change-b
+│    checks   ✗ build   ✓ clippy
+│    review   changes requested by @bob
+│    threads  ▸ src/c.rs:12  @bob  "Please rename this"
+```
+
+`--json` prints the same information for scripts, bottom first: the changes
+with their Pull Requests, the GitHub stacks, the findings (each with a stable
+`kind`, such as `failing_checks` or `needs_update`), and `ready_to_land`.
+
 It only reads from GitHub and the repository, and changes nothing. Use `-r` to
 pick another stack, and `--native-stack` or `--no-native-stack` to override
 `spr.nativeStacks` for its checks.
