@@ -61,6 +61,13 @@ pub async fn land(
         )));
     }
 
+    if pull_request.is_draft {
+        return Err(Error::new(format!(
+            "Pull Request #{pull_request_number} is a draft. Mark it ready for review \
+             first (for example with `gh pr ready {pull_request_number}`)."
+        )));
+    }
+
     if config.require_approval && pull_request.review_decision != ReviewDecision::Approved {
         return Err(Error::new(
             "This Pull Request has not been approved on GitHub.",
