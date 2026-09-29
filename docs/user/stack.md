@@ -311,6 +311,34 @@ Before landing:
 ◆  main@origin (now includes rlvkpnrw)
 ```
 
+### Checking a stack
+
+`jj spr stack` shows the local stack (top first, like `jj log`) next to each
+change's Pull Request, its state and its base branch, and the GitHub stack
+they belong to:
+
+```
+  🧱  GitHub stack #1: #1, #2, #3 (bottom first)
+○  ryxopsnk  Change C  #3  open, needs update  → spr/change-b
+○  ywpvrkrt  Change X  #4  open                → spr/change-b
+○  nrlzpwsu  Change B  #2  open                → spr/change-a
+○  xrrqyttw  Change A  #1  open                → main
+◆  main@origin
+
+  ⚠️  The local change for #3 differs from the Pull Request. Run `jj
+      spr diff --all` to update it.
+  ⚠️  #3 targets spr/change-b, but the change below it is #4
+      (spr/change-x). Run `jj spr diff --all` to restack it.
+```
+
+It points out anything that does not match, with the command that fixes it:
+changes without a Pull Request, local changes that differ from their Pull
+Request, drafts, merged or closed Pull Requests, and, for native stacks, Pull
+Requests that target the wrong branch or are missing from the GitHub stack.
+It only reads from GitHub and the repository, and changes nothing. Use `-r` to
+pick another stack, and `--native-stack` or `--no-native-stack` to override
+`spr.nativeStacks` for its checks.
+
 ### Syncing after merges
 
 `jj spr sync` brings a local stack up to date after some of its Pull Requests
