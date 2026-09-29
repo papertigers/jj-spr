@@ -1,9 +1,8 @@
 //! End-to-end tests of `jj spr diff`, `land` and `close` with native GitHub
 //! stacks, against a fake GitHub (see `common/fake_github.rs`).
 //!
-//! These mirror `tests/native_stacks/run_scenarios.py` scenario for scenario,
-//! under the same names. They need `jj` and `git` on `PATH`, like the other
-//! integration tests. Set `SPR_TEST_VERBOSE=1` to print every command.
+//! They need `jj` and `git` on `PATH`, like the other integration tests. Set
+//! `SPR_TEST_VERBOSE=1` to print every command.
 
 mod common;
 
@@ -378,4 +377,31 @@ fn stacks_disabled() {
         );
     }
     assert!(env.stacks().is_empty(), "no stacks when disabled");
+}
+
+#[test]
+fn github_rebase_after_merge_keeps_edits_in_merge_commits() {
+    // Amending a change and the one below it in one run gives the upper PR
+    // an update commit that is a merge carrying its own edit. GitHub's
+    // post-merge rebase drops merge commits, so check what survives.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    std::fs::write(env.work.join("b.txt"), "b, edited\n").unwrap();
+    env.jj(&["squash", "--into", &changes[1]]);
+    std::fs::write(env.work.join("c.txt"), "c, edited\n").unwrap();
+    env.jj(&["squash", "--into", &changes[2]]);
+    env.spr(&["diff", "--all", "-m", "edit B and C"]);
+    let show = |env: &TestEnv, n: u64, path: &str| {
+        env.remote_git(&["show", &format!("{}:{path}", env.head_of(n))])
+    };
+    assert_eq!(show(&env, prs[2], "c.txt"), "c, edited");
+
+    env.spr(&["land", "-r", &changes[0]]);
+    assert_eq!(
+        show(&env, prs[2], "c.txt"),
+        "c, edited",
+        "C's edit was in a merge commit that GitHub's rebase dropped"
+    );
+    assert_eq!(env.pr_files(prs[2]), vec!["c.txt"]);
 }
