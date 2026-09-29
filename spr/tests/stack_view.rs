@@ -19,8 +19,11 @@ fn stack_clean() {
     let changes = env.build_stack(&["a", "b", "c"]);
     let out = env.spr(&["stack"]);
 
+    // Stacks are numbered like pull requests, so this one is #4.
+    let stack = *env.stacks().keys().next().unwrap();
     assert!(
-        out.text.contains("GitHub stack #1: #1, #2, #3"),
+        out.text
+            .contains(&format!("GitHub stack #{stack}: #1, #2, #3")),
         "{}",
         out.text
     );
@@ -164,10 +167,12 @@ fn stack_reports_unregistered_stack() {
 fn stack_reports_missing_member() {
     let env = TestEnv::new();
     env.build_stack(&["a", "b", "c"]);
-    env.gh.state().stacks.insert(1, vec![1, 2]);
+    let stack = *env.stacks().keys().next().unwrap();
+    env.gh.state().stacks.insert(stack, vec![1, 2]);
     let out = env.spr(&["stack"]);
     assert!(
-        out.flat().contains("#3 is not in GitHub stack #1 yet"),
+        out.flat()
+            .contains(&format!("#3 is not in GitHub stack #{stack} yet")),
         "{}",
         out.text
     );
@@ -187,7 +192,10 @@ fn stack_reports_insertion() {
     let flat = out.flat();
     // C still targets B, but X now sits between them.
     assert!(
-        flat.contains("#3 targets spr/change-b, but the change below it is #4 (spr/change-x)"),
+        flat.contains(&format!(
+            "#3 targets spr/change-b, but the change below it is #{} (spr/change-x)",
+            env.pr_for(&inserted)
+        )),
         "{}",
         out.text
     );
