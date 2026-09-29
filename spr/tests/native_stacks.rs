@@ -338,6 +338,33 @@ fn land_refuses_middle() {
 }
 
 #[test]
+fn land_refuses_draft() {
+    for stacks_enabled in [true, false] {
+        let env = TestEnv::with_stacks(stacks_enabled);
+        let changes = vec![
+            env.commit("Change A", "a.txt", "a\n"),
+            env.commit("Change B", "b.txt", "b\n"),
+        ];
+        env.spr(&["diff", "--all", "--draft"]);
+        let prs = env.prs_for(&changes);
+        let requests = env.request_count();
+
+        let out = env.try_spr(&["land", "-r", &changes[0]]);
+        assert!(!out.success, "land should refuse a draft:\n{}", out.text);
+        assert!(
+            out.flat().contains(&format!("#{} is a draft", prs[0])),
+            "{}",
+            out.text
+        );
+        assert!(
+            env.requests_since(requests, "PUT", "merge").is_empty(),
+            "no merge should be attempted"
+        );
+        assert!(env.pr(prs[0]).is_open());
+    }
+}
+
+#[test]
 fn close_keeps_dependents() {
     let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b", "c"]);

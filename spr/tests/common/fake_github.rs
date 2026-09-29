@@ -678,13 +678,19 @@ impl State {
             }
             ("PUT", ["pulls", n, "merge"]) => {
                 let n = parse_number(n)?;
-                let head_ref = self.pr_mut(n)?.head_ref.clone();
+                let (head_ref, draft) = {
+                    let pr = self.pr_mut(n)?;
+                    (pr.head_ref.clone(), pr.draft)
+                };
                 if self.stack_of(n).is_some() {
                     return api_error(
                         403,
                         "Merging stacked PRs via this endpoint is not supported. Use the \
                          asynchronous merge endpoint instead.",
                     );
+                }
+                if draft {
+                    return api_error(405, "Pull Request is still a draft");
                 }
                 if let Some(sha) = body["sha"].as_str()
                     && self.branches().get(&head_ref).map(String::as_str) != Some(sha)
