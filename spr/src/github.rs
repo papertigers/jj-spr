@@ -284,7 +284,7 @@ impl GitHub {
         let repo = git2::Repository::open(&self.repo_path)?;
         let rev_parse = |reference: &str| {
             repo.refname_to_id(reference)
-                .unwrap_or_else(|_| git2::Oid::zero())
+                .unwrap_or(git2::Oid::ZERO_SHA1)
         };
         let base_oid = rev_parse(base.local());
         let head_oid = rev_parse(head.local());
