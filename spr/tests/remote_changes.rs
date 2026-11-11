@@ -229,7 +229,10 @@ fn build_stack_where_c_undoes_part_of_b(env: &TestEnv) -> Vec<String> {
     let c = env.commit("Change C", "shared.txt", "one\ntwo\n");
     env.spr(&["diff", "--all", "-m", "initial"]);
     // B moves on after C exists (as #1243 did), so no earlier version of C
-    // happens to have B's current tree.
+    // contains what the rewritten branch holds: the first version of C is
+    // empty on B, so its tree is B's as it was then. (Real GitHub replays
+    // B's edit into B's branch too, which this shortcut leaves out; see
+    // `diff_after_github_restacks_a_converted_stack` for the real shape.)
     std::fs::write(env.work.join("b.txt"), "b\n").unwrap();
     env.jj(&["squash", "--into", &b]);
     env.spr(&["diff", "--all", "-m", "edit B"]);
@@ -271,4 +274,115 @@ fn diff_refuses_colleagues_push_on_top_of_parents_content() {
         out.text
     );
     assert_eq!(heads(&env, &prs), before, "nothing may be pushed");
+}
+
+/// Make `change` a commit that jj imported from Git, with no history in
+/// `jj evolog`, as for a change created on another machine. Returns its
+/// new change ID.
+fn reimport_without_evolog(env: &TestEnv, change: &str) -> String {
+    let commit = env.commit_id(change);
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&env.work)
+            .args(args)
+            .envs([
+                ("GIT_AUTHOR_NAME", "Test"),
+                ("GIT_AUTHOR_EMAIL", "test@example.com"),
+                ("GIT_COMMITTER_NAME", "Test"),
+                ("GIT_COMMITTER_EMAIL", "test@example.com"),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let message = git(&["log", "-1", "--format=%B", &commit]);
+    let copy = git(&[
+        "commit-tree",
+        &format!("{commit}^{{tree}}"),
+        "-p",
+        &format!("{commit}^"),
+        "-m",
+        &message,
+    ]);
+    git(&["update-ref", "refs/heads/reimport", &copy]);
+    env.jj(&["git", "import"]);
+    env.jj(&["abandon", change]);
+    env.jj(&["new", &copy]);
+    env.jj(&["bookmark", "forget", "reimport"]);
+    let id = env.change_id(&copy);
+    assert_eq!(
+        env.jj_query(&[
+            "evolog",
+            "--no-graph",
+            "-r",
+            &id,
+            "-T",
+            "commit.commit_id() ++ \"\\n\""
+        ])
+        .lines()
+        .count(),
+        1,
+        "the copy should have no earlier versions"
+    );
+    id
+}
+
+/// The propolis #1241-#1245 history: Pull Requests opened without native
+/// stacks, so each one's own change is in a merge commit, then made into a
+/// stack. B moves on after C exists, and C removes a line that B adds.
+/// Returns the changes once `main` has moved and GitHub's stack rebase
+/// (which drops merge commits) has left C's branch with only B's content.
+fn converted_stack_after_github_restack(env: &TestEnv, without_evolog: bool) -> Vec<String> {
+    env.push_to_main("shared.txt", "one\ntwo\n");
+    env.jj(&["git", "fetch"]);
+    env.jj(&["new", "main@origin"]);
+    let a = env.commit("Change A", "a.txt", "a\n");
+    std::fs::write(env.work.join("b.txt"), "b\n").unwrap();
+    let b = env.commit("Change B", "shared.txt", "one\nnote\ntwo\n");
+    std::fs::write(env.work.join("c.txt"), "c\n").unwrap();
+    let mut c = env.commit("Change C", "shared.txt", "one\ntwo\n");
+    if without_evolog {
+        c = reimport_without_evolog(env, &c);
+    }
+    env.spr(&["diff", "--all", "--no-native-stack", "-m", "initial"]);
+    std::fs::write(env.work.join("b2.txt"), "b2\n").unwrap();
+    env.jj(&["squash", "--into", &b]);
+    env.spr(&["diff", "--all", "--no-native-stack", "-m", "edit B"]);
+    env.spr(&["diff", "--all", "--native-stack", "-m", "make them a stack"]);
+    let changes = vec![a, b, c];
+    let prs = env.prs_for(&changes);
+
+    env.push_to_main("other.txt", "other\n");
+    env.gh.state().rebase_stack_on_github(prs[0]);
+    // What GitHub did to propolis: C's branch holds B's content, not C's.
+    let c_head = env.head_of(prs[2]);
+    let files = env.remote_git(&["ls-tree", "--name-only", &c_head]);
+    assert!(!files.lines().any(|f| f == "c.txt"), "{files}");
+    assert_eq!(
+        env.remote_git(&["show", &format!("{c_head}:shared.txt")]),
+        "one\nnote\ntwo"
+    );
+    env.spr(&["sync"]);
+    changes
+}
+
+#[test]
+fn diff_after_github_restacks_a_converted_stack() {
+    let env = TestEnv::new();
+    let changes = converted_stack_after_github_restack(&env, false);
+    env.spr(&["diff", "--all", "-m", "after GitHub's restack"]);
+    let prs = env.check_chain(&changes);
+    assert_eq!(env.pr_files(prs[2]), vec!["c.txt", "shared.txt"]);
+}
+
+#[test]
+fn diff_after_github_restacks_a_change_with_no_evolog() {
+    // As above, but C came from elsewhere, so no earlier version of it holds
+    // B's content: only the local parent shows that pushing loses nothing.
+    let env = TestEnv::new();
+    let changes = converted_stack_after_github_restack(&env, true);
+    env.spr(&["diff", "--all", "-m", "after GitHub's restack"]);
+    let prs = env.check_chain(&changes);
+    assert_eq!(env.pr_files(prs[2]), vec!["c.txt", "shared.txt"]);
 }
