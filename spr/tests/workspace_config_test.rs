@@ -219,3 +219,56 @@ fn test_config_set_in_workspace_is_shared() {
         "Config should be readable from workspace where it was set"
     );
 }
+
+#[test]
+fn test_repo_with_relative_worktrees_can_be_opened() {
+    let (temp_dir, main_repo_path) = create_jj_repo();
+
+    // `git worktree add --relative-paths` (git >= 2.48) sets
+    // `extensions.relativeWorktrees` in the shared repo config, which older
+    // libgit2 versions refuse to open.
+    let worktree_help = Command::new("git")
+        .args(["worktree", "add", "-h"])
+        .current_dir(&main_repo_path)
+        .output()
+        .expect("Failed to run git worktree add -h");
+    if !String::from_utf8_lossy(&worktree_help.stdout).contains("relative-paths") {
+        eprintln!("skipping: git does not support --relative-paths");
+        return;
+    }
+
+    // Give git a HEAD commit to check out in the worktree
+    let commit_output = Command::new("jj")
+        .args(["commit", "-m", "initial"])
+        .current_dir(&main_repo_path)
+        .output()
+        .expect("Failed to run jj commit");
+    assert!(
+        commit_output.status.success(),
+        "Failed to commit: {}",
+        String::from_utf8_lossy(&commit_output.stderr)
+    );
+
+    let worktree_path = temp_dir.path().join("relative-worktree");
+    let worktree_output = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "--relative-paths",
+            "--detach",
+            worktree_path.to_str().unwrap(),
+        ])
+        .current_dir(&main_repo_path)
+        .output()
+        .expect("Failed to run git worktree add");
+    assert!(
+        worktree_output.status.success(),
+        "Failed to add worktree: {}",
+        String::from_utf8_lossy(&worktree_output.stderr)
+    );
+
+    jj_spr::jj::Jujutsu::new(main_repo_path)
+        .unwrap_or_else(|e| panic!("Failed to open repo with relative worktrees: {}", e));
+    git2::Repository::open(&worktree_path)
+        .unwrap_or_else(|e| panic!("Failed to open relative worktree: {}", e));
+}
