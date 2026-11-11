@@ -200,3 +200,35 @@ fn diff_checks_reviewers_before_pushing() {
     env.jj(&["commit", "-m", "Change C\n\nReviewers: nobody-at-all"]);
     assert_refused_before_changing_anything(&env, &prs, "nobody-at-all");
 }
+
+#[test]
+fn diff_range_not_starting_on_main_refuses_without_the_parents_pr() {
+    // papertigers/jj-spr#14: `-r A..B` opened a PR for B against main that
+    // also contained A's changes.
+    let env = TestEnv::new();
+    let a = env.commit("Change A", "a.txt", "a\n");
+    let b = env.commit("Change B", "b.txt", "b\n");
+
+    let out = env.try_spr(&["diff", "-r", &format!("{a}..{b}"), "-m", "range"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains("has no Pull Request yet"),
+        "{}",
+        out.text
+    );
+    assert!(!out.text.contains("Created new"), "{}", out.text);
+}
+
+#[test]
+fn diff_range_not_starting_on_main_stacks_on_the_parents_pr() {
+    let env = TestEnv::new();
+    let a = env.commit("Change A", "a.txt", "a\n");
+    let b = env.commit("Change B", "b.txt", "b\n");
+    env.spr(&["diff", "-r", &a, "-m", "A"]);
+    let pa = env.pr_for(&a);
+
+    env.spr(&["diff", "-r", &format!("{a}..{b}"), "-m", "range"]);
+    let pb = env.pr_for(&b);
+    assert_eq!(env.pr(pb).base_ref, env.pr(pa).head_ref);
+    assert_eq!(env.pr_files(pb), vec!["b.txt"]);
+}
