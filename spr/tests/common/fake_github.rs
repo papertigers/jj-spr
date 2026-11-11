@@ -681,6 +681,25 @@ impl State {
         }
     }
 
+    /// The stack's rebase button in GitHub's web UI: replay every open
+    /// member, bottom first, onto the current head of the stack's base.
+    pub fn rebase_stack_on_github(&mut self, number: u64) {
+        let stack = self.stack_of(number).expect("not in a stack");
+        let members = self.active(&self.stacks[&stack].clone());
+        let base_ref = self.prs[&members[0]].base_ref.clone();
+        let heads = self.branches();
+        let bottom_head = heads[&self.prs[&members[0]].head_ref].clone();
+        let fork = self.git(&["merge-base", &bottom_head, &heads[&base_ref]]);
+        let (mut previous_base, mut previous_old) = (base_ref, fork);
+        for number in members {
+            let head_ref = self.prs[&number].head_ref.clone();
+            let old_head = self.branches()[&head_ref].clone();
+            self.rebase_onto(number, &previous_old, &previous_base);
+            previous_base = head_ref;
+            previous_old = old_head;
+        }
+    }
+
     /// Close a Pull Request without merging it, as in GitHub's web UI.
     pub fn close_on_github(&mut self, number: u64) {
         let pr = self.prs.get_mut(&number).expect("no such pull request");

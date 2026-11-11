@@ -400,6 +400,37 @@ impl Jujutsu {
         Ok(self.git_repo.merge_base(pr.head_oid, base)?)
     }
 
+    /// The newer commit of the main branch that a Pull Request's head is
+    /// based on, if GitHub moved it there and `local_base` (the parent of the
+    /// local change) is older. That happens when someone presses the stack's
+    /// rebase button or "Update branch" in GitHub's web UI. It is `None` when
+    /// only the main branch moved, so that a stack is never rebased merely
+    /// because main has new commits.
+    pub fn newer_main_base(
+        &self,
+        config: &Config,
+        local_base: Oid,
+        remote_head: Oid,
+    ) -> Result<Option<Oid>> {
+        if remote_head.is_zero() || self.tree_if_present(remote_head).is_none() {
+            return Ok(None);
+        }
+        let main = self.resolve_reference(config.master_ref.local())?;
+        let remote_base = match self.git_repo.merge_base(remote_head, main) {
+            Ok(base) => base,
+            // No common history: GitHub did not move it onto main.
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if remote_base != local_base
+            && self.git_repo.graph_descendant_of(remote_base, local_base)?
+        {
+            Ok(Some(remote_base))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Whether the Pull Request has edits that its local change lacks, so
     /// that pushing the local change would drop them.
     ///

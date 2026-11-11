@@ -275,3 +275,60 @@ fn sync_after_local_rebase_without_resubmitting() {
     );
     assert_rebased_onto_main(&env, &changes[1..]);
 }
+
+#[test]
+fn sync_after_github_rebased_stack() {
+    // Nothing merged, but someone pressed the stack's rebase button after
+    // main moved. Pushing from the old base would make the bottom PR look
+    // like it reverts other.txt, so sync rebases the local stack to match.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    env.push_to_main("other.txt", "other\n");
+    env.gh.state().rebase_stack_on_github(prs[0]);
+
+    let out = env.spr(&["sync"]);
+    assert!(out.flat().contains("GitHub rebased"), "{}", out.text);
+    assert!(changes.iter().all(|c| env.is_visible(c)));
+    assert_rebased_onto_main(&env, &changes);
+    assert!(out.flat().contains("jj spr diff --all"), "{}", out.text);
+
+    env.spr(&["diff", "--all", "-m", "after sync"]);
+    env.check_chain(&changes);
+    assert_eq!(env.pr_files(prs[0]), vec!["a.txt"]);
+    assert_eq!(env.pr_files(prs[1]), vec!["b.txt"]);
+    assert_eq!(env.pr_files(prs[2]), vec!["c.txt"]);
+}
+
+#[test]
+fn sync_dry_run_after_github_rebased_stack() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    env.push_to_main("other.txt", "other\n");
+    env.gh.state().rebase_stack_on_github(prs[0]);
+    let before: Vec<String> = changes.iter().map(|c| env.commit_id(c)).collect();
+
+    let out = env.spr(&["sync", "--dry-run"]);
+    assert!(out.text.contains("Would rebase"), "{}", out.text);
+    let after: Vec<String> = changes.iter().map(|c| env.commit_id(c)).collect();
+    assert_eq!(before, after, "a dry run must not change anything");
+}
+
+#[test]
+fn sync_after_github_updated_branch() {
+    // "Update branch" on an ordinary PR merges main into it: the same
+    // situation as the stack's rebase button.
+    let env = TestEnv::new();
+    let change = env.commit("Change A", "a.txt", "a\n");
+    env.spr(&["diff", "-r", &change, "--cherry-pick", "-m", "ordinary"]);
+    let pr = env.pr_for(&change);
+    env.push_to_main("other.txt", "other\n");
+    env.gh.state().update_branch(pr);
+
+    let out = env.spr(&["sync"]);
+    assert!(out.flat().contains("GitHub rebased"), "{}", out.text);
+    assert_rebased_onto_main(&env, std::slice::from_ref(&change));
+    env.spr(&["diff", "-r", &change, "--cherry-pick", "-m", "after sync"]);
+    assert_eq!(env.pr_files(pr), vec!["a.txt"]);
+}
