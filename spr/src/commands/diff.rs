@@ -199,6 +199,8 @@ pub async fn diff(
         )));
     }
 
+    refuse_shared_pull_requests(jj, config, &prepared_commits)?;
+
     let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
 
     let pull_requests = gh
@@ -496,6 +498,57 @@ fn plan_native_bases(
             }
         })
         .collect()
+}
+
+/// Refuse when two changes link the same Pull Request: the selected ones,
+/// and the parent of the bottom one (which the bottom Pull Request may
+/// target). `jj split` and `jj duplicate` copy the `Pull Request:` line, and
+/// pushing both copies to one Pull Request would make it its own base.
+fn refuse_shared_pull_requests(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    commits: &[crate::jj::PreparedCommit],
+) -> Result<()> {
+    let mut linked: Vec<crate::jj::PreparedCommit> = Vec::new();
+    if let Some(bottom) = commits.first() {
+        let parent = jj.prepare_commit(config, bottom.parent_oid)?;
+        if parent.pull_request_number.is_some() {
+            linked.push(parent);
+        }
+    }
+    linked.extend(
+        commits
+            .iter()
+            .filter(|c| c.pull_request_number.is_some())
+            .cloned(),
+    );
+    let change_ids = jj.change_ids_for(&linked)?;
+    let mut by_number: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+    for commit in &linked {
+        let id = change_ids
+            .get(&commit.oid)
+            .map(|id| crate::jj::short(id).to_string())
+            .unwrap_or_else(|| commit.short_id.clone());
+        by_number
+            .entry(commit.pull_request_number.unwrap())
+            .or_default()
+            .push(id);
+    }
+    let shared: Vec<String> = by_number
+        .iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(n, ids)| format!("#{n}: {}", ids.join(", ")))
+        .collect();
+    if shared.is_empty() {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "Not submitting: more than one change links the same Pull Request \
+         (as after `jj split` or `jj duplicate`):\n{}\nKeep the `Pull Request:` \
+         line on the change that should update it, and remove it from the \
+         others (with `jj describe`); they get Pull Requests of their own.",
+        shared.join("\n")
+    )))
 }
 
 /// Find the Pull Request of a change's parent, which a natively stacked Pull
