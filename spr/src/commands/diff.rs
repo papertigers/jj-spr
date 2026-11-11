@@ -185,6 +185,20 @@ pub async fn diff(
         return result;
     };
 
+    // A conflicted change would be pushed as jj's conflict files.
+    let selected = prepared_commits
+        .iter()
+        .map(|c| c.oid.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let conflicted = jj.conflicted_changes(&selected)?;
+    if !conflicted.is_empty() {
+        return Err(Error::new(format!(
+            "Not submitting: these changes have conflicts:\n{conflicted}\nResolve them \
+             (for example with `jj resolve`) and run `jj spr diff` again.",
+        )));
+    }
+
     let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
 
     let pull_requests = gh
