@@ -583,6 +583,13 @@ impl State {
     // -- merging -----------------------------------------------------------
 
     fn squash_merge(&mut self, number: u64) -> String {
+        self.squash_merge_from(number, None)
+    }
+
+    /// Squash-merge `number` into its base. `merge_base` is where its own
+    /// changes start, when that is not the merge base with the base branch
+    /// (a stacked PR whose parent was just squash-merged below it).
+    fn squash_merge_from(&mut self, number: u64, merge_base: Option<&str>) -> String {
         let heads = self.branches();
         let (base_ref, head_ref, title) = {
             let pr = &self.prs[&number];
@@ -590,7 +597,7 @@ impl State {
         };
         let (base, head) = (heads[&base_ref].clone(), heads[&head_ref].clone());
         let message = format!("{title} (#{number})");
-        let commit = self.merge_tree_commit(None, &base, &head, &[&base], &message, None);
+        let commit = self.merge_tree_commit(merge_base, &base, &head, &[&base], &message, None);
         self.git(&["update-ref", &format!("refs/heads/{base_ref}"), &commit]);
         let pr = self.prs.get_mut(&number).unwrap();
         pr.merged_at = Some(now());
@@ -637,9 +644,12 @@ impl State {
         let (prefix, survivors) = (members[..cut].to_vec(), members[cut..].to_vec());
         let base_ref = self.prs[&prefix[0]].base_ref.clone();
         let old_top = self.branches()[&self.prs[&prefix[cut - 1]].head_ref].clone();
+        let mut below: Option<String> = None;
         for number in &prefix {
+            let head = self.branches()[&self.prs[number].head_ref].clone();
             self.prs.get_mut(number).unwrap().base_ref = base_ref.clone();
-            self.squash_merge(*number);
+            self.squash_merge_from(*number, below.as_deref());
+            below = Some(head);
         }
         let (mut previous_base, mut previous_old) = (base_ref.clone(), old_top);
         for number in survivors {

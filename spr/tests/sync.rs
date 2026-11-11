@@ -332,3 +332,31 @@ fn sync_after_github_updated_branch() {
     env.spr(&["diff", "-r", &change, "--cherry-pick", "-m", "after sync"]);
     assert_eq!(env.pr_files(pr), vec!["a.txt"]);
 }
+
+#[test]
+fn sync_keeps_a_change_that_undoes_part_of_a_merged_one() {
+    // C removes a line B adds. Abandoning B before rebasing would put C on
+    // B's parent (main with A), where there is no line to remove, and the
+    // later rebase onto main (which has B's line) would leave the line in.
+    let env = TestEnv::new();
+    let changes = vec![
+        env.commit("Change A", "shared.txt", "one\ntwo\n"),
+        env.commit("Change B", "shared.txt", "one\nnote\ntwo\n"),
+        env.commit("Change C", "shared.txt", "one\ntwo\n"),
+    ];
+    env.spr(&["diff", "--all", "-m", "stack"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().merge_on_github(prs[0]);
+    env.spr(&["sync"]);
+    env.spr(&["diff", "--all", "-m", "after landing A"]);
+    env.gh.state().merge_on_github(prs[1]);
+
+    env.spr(&["sync"]);
+    assert!(!env.is_visible(&changes[1]));
+    assert_rebased_onto_main(&env, &changes[2..]);
+    assert_eq!(env.files_in(&changes[2]), vec!["shared.txt"]);
+    assert_eq!(
+        env.jj_query(&["file", "show", "-r", &changes[2], "shared.txt"]),
+        "one\ntwo\n"
+    );
+}

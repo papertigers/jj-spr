@@ -182,6 +182,14 @@ pub async fn sync(
         return Ok(());
     }
 
+    // Rebase before abandoning. Abandoning first would move what is left onto
+    // the parent of the merged changes and then onto the main branch: two
+    // rebases, and a change that undoes part of a merged one loses that part
+    // (the first rebase drops it, as there is nothing there to undo).
+    if let Some(root) = remaining.first() {
+        rebase_onto_main(jj, &trunk, root, remaining.len())?;
+    }
+
     let mut abandon = vec!["abandon".to_string()];
     abandon.extend(merged.iter().map(|c| c.change_id.clone()));
     jj.run(&abandon)?;
@@ -201,7 +209,7 @@ pub async fn sync(
         output("🎉", "Every change in this stack has merged.")?;
         return Ok(());
     }
-    rebase_remaining(jj, &trunk, &remaining)
+    check_rebased(jj, &trunk, &remaining)
 }
 
 /// Nothing merged: rebase the stack only if GitHub already moved its bottom
@@ -247,22 +255,27 @@ fn rebase_onto_newer_main(
         )?;
         return Ok(());
     }
-    rebase_remaining(jj, &trunk, remaining)
+    rebase_onto_main(jj, &trunk, root, remaining.len())?;
+    check_rebased(jj, &trunk, remaining)
 }
 
-/// Rebase `remaining` (bottom first) onto the main branch and stop on
-/// conflicts.
-fn rebase_remaining(jj: &crate::jj::Jujutsu, trunk: &str, remaining: &[&Change]) -> Result<()> {
-    let (Some(root), Some(top)) = (remaining.first(), remaining.last()) else {
+/// Rebase `root` and its descendants (`count` changes) onto the main branch.
+fn rebase_onto_main(
+    jj: &crate::jj::Jujutsu,
+    trunk: &str,
+    root: &Change,
+    count: usize,
+) -> Result<()> {
+    jj.run(["rebase", "-s", &root.change_id, "-d", trunk])?;
+    output("⤴️ ", &format!("Rebased {count} change(s) onto {trunk}"))
+}
+
+/// After rebasing `remaining` (bottom first): stop on conflicts, or say what
+/// to do next.
+fn check_rebased(jj: &crate::jj::Jujutsu, trunk: &str, remaining: &[&Change]) -> Result<()> {
+    let Some(top) = remaining.last() else {
         return Ok(());
     };
-
-    jj.run(["rebase", "-s", &root.change_id, "-d", trunk])?;
-    output(
-        "⤴️ ",
-        &format!("Rebased {} change(s) onto {trunk}", remaining.len()),
-    )?;
-
     let conflicted = jj.conflicted_changes(&format!("{trunk}..{}", top.change_id))?;
     if !conflicted.is_empty() {
         return Err(Error::new(format!(
