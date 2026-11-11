@@ -8,8 +8,13 @@
 //!
 //! It fetches, abandons the local changes whose Pull Requests merged, and
 //! rebases what is left of the stack onto the main branch. Nothing is
-//! changed unless every merged change can be abandoned safely, and it never
-//! rebases merely because the main branch moved; `jj rebase` owns that.
+//! changed unless every merged change can be abandoned safely.
+//!
+//! It also rebases when nothing merged but GitHub already moved the stack
+//! onto a newer main branch (the stack's rebase button, or "Update branch"):
+//! pushing from the old base would make the bottom Pull Request look like it
+//! reverts what landed in between. It never rebases merely because the main
+//! branch moved; `jj rebase` owns that.
 
 use git2::Oid;
 
@@ -51,6 +56,8 @@ struct Change {
     commit: PreparedCommit,
     change_id: String,
     status: Status,
+    /// The Pull Request's head, from the remote-tracking branch.
+    head_oid: Option<Oid>,
 }
 
 impl Change {
@@ -93,6 +100,7 @@ pub async fn sync(
         .await?;
     let mut changes = Vec::new();
     for (commit, pull_request) in commits.into_iter().zip(pull_requests) {
+        let head_oid = pull_request.as_ref().map(|pr| pr.head_oid);
         let status = match pull_request {
             None => Status::Unsubmitted,
             Some(pull_request) => status_of(jj, config, &commit, &pull_request).await?,
@@ -105,6 +113,7 @@ pub async fn sync(
             commit,
             change_id,
             status,
+            head_oid,
         });
     }
 
@@ -149,14 +158,13 @@ pub async fn sync(
         .iter()
         .filter(|c| matches!(c.status, Status::Merged(_)))
         .collect();
-    if merged.is_empty() {
-        output("✅", "Nothing in this stack has merged. Nothing to do.")?;
-        return Ok(());
-    }
     let remaining: Vec<&Change> = changes
         .iter()
         .filter(|c| !matches!(c.status, Status::Merged(_)))
         .collect();
+    if merged.is_empty() {
+        return rebase_onto_newer_main(&opts, jj, config, &remaining);
+    }
 
     if opts.dry_run {
         for change in &merged {
@@ -174,6 +182,14 @@ pub async fn sync(
         return Ok(());
     }
 
+    // Rebase before abandoning. Abandoning first would move what is left onto
+    // the parent of the merged changes and then onto the main branch: two
+    // rebases, and a change that undoes part of a merged one loses that part
+    // (the first rebase drops it, as there is nothing there to undo).
+    if let Some(root) = remaining.first() {
+        rebase_onto_main(jj, &trunk, root, remaining.len())?;
+    }
+
     let mut abandon = vec!["abandon".to_string()];
     abandon.extend(merged.iter().map(|c| c.change_id.clone()));
     jj.run(&abandon)?;
@@ -189,17 +205,77 @@ pub async fn sync(
         ),
     )?;
 
-    let (Some(root), Some(top)) = (remaining.first(), remaining.last()) else {
+    if remaining.is_empty() {
         output("🎉", "Every change in this stack has merged.")?;
         return Ok(());
+    }
+    check_rebased(jj, &trunk, &remaining)
+}
+
+/// Nothing merged: rebase the stack only if GitHub already moved its bottom
+/// Pull Request onto a newer main branch than the local stack is on.
+fn rebase_onto_newer_main(
+    opts: &SyncOptions,
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    remaining: &[&Change],
+) -> Result<()> {
+    let trunk = config.trunk_revset();
+    let moved = match remaining.first() {
+        Some(
+            root @ Change {
+                status: Status::Open(n),
+                head_oid: Some(head),
+                ..
+            },
+        ) => jj
+            .newer_main_base(config, root.commit.parent_oid, *head)?
+            .map(|base| (root, *n, base)),
+        _ => None,
     };
-
-    jj.run(["rebase", "-s", &root.change_id, "-d", &trunk])?;
+    let Some((root, number, base)) = moved else {
+        output("✅", "Nothing in this stack has merged. Nothing to do.")?;
+        return Ok(());
+    };
     output(
-        "⤴️ ",
-        &format!("Rebased {} change(s) onto {trunk}", remaining.len()),
+        "⚾",
+        &format!(
+            "Nothing has merged, but GitHub rebased #{number} onto a newer {trunk} ({}), \
+             and the local stack is still on an older one.",
+            &base.to_string()[..8]
+        ),
     )?;
+    if opts.dry_run {
+        output(
+            "  ",
+            &format!(
+                "Would rebase {} and its descendants onto {trunk}",
+                short(&root.change_id)
+            ),
+        )?;
+        return Ok(());
+    }
+    rebase_onto_main(jj, &trunk, root, remaining.len())?;
+    check_rebased(jj, &trunk, remaining)
+}
 
+/// Rebase `root` and its descendants (`count` changes) onto the main branch.
+fn rebase_onto_main(
+    jj: &crate::jj::Jujutsu,
+    trunk: &str,
+    root: &Change,
+    count: usize,
+) -> Result<()> {
+    jj.run(["rebase", "-s", &root.change_id, "-d", trunk])?;
+    output("⤴️ ", &format!("Rebased {count} change(s) onto {trunk}"))
+}
+
+/// After rebasing `remaining` (bottom first): stop on conflicts, or say what
+/// to do next.
+fn check_rebased(jj: &crate::jj::Jujutsu, trunk: &str, remaining: &[&Change]) -> Result<()> {
+    let Some(top) = remaining.last() else {
+        return Ok(());
+    };
     let conflicted = jj.conflicted_changes(&format!("{trunk}..{}", top.change_id))?;
     if !conflicted.is_empty() {
         return Err(Error::new(format!(

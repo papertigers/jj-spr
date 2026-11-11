@@ -583,6 +583,13 @@ impl State {
     // -- merging -----------------------------------------------------------
 
     fn squash_merge(&mut self, number: u64) -> String {
+        self.squash_merge_from(number, None)
+    }
+
+    /// Squash-merge `number` into its base. `merge_base` is where its own
+    /// changes start, when that is not the merge base with the base branch
+    /// (a stacked PR whose parent was just squash-merged below it).
+    fn squash_merge_from(&mut self, number: u64, merge_base: Option<&str>) -> String {
         let heads = self.branches();
         let (base_ref, head_ref, title) = {
             let pr = &self.prs[&number];
@@ -590,7 +597,7 @@ impl State {
         };
         let (base, head) = (heads[&base_ref].clone(), heads[&head_ref].clone());
         let message = format!("{title} (#{number})");
-        let commit = self.merge_tree_commit(None, &base, &head, &[&base], &message, None);
+        let commit = self.merge_tree_commit(merge_base, &base, &head, &[&base], &message, None);
         self.git(&["update-ref", &format!("refs/heads/{base_ref}"), &commit]);
         let pr = self.prs.get_mut(&number).unwrap();
         pr.merged_at = Some(now());
@@ -637,9 +644,12 @@ impl State {
         let (prefix, survivors) = (members[..cut].to_vec(), members[cut..].to_vec());
         let base_ref = self.prs[&prefix[0]].base_ref.clone();
         let old_top = self.branches()[&self.prs[&prefix[cut - 1]].head_ref].clone();
+        let mut below: Option<String> = None;
         for number in &prefix {
+            let head = self.branches()[&self.prs[number].head_ref].clone();
             self.prs.get_mut(number).unwrap().base_ref = base_ref.clone();
-            self.squash_merge(*number);
+            self.squash_merge_from(*number, below.as_deref());
+            below = Some(head);
         }
         let (mut previous_base, mut previous_old) = (base_ref.clone(), old_top);
         for number in survivors {
@@ -678,6 +688,25 @@ impl State {
             self.complete_stack_merge(number);
         } else {
             self.squash_merge(number);
+        }
+    }
+
+    /// The stack's rebase button in GitHub's web UI: replay every open
+    /// member, bottom first, onto the current head of the stack's base.
+    pub fn rebase_stack_on_github(&mut self, number: u64) {
+        let stack = self.stack_of(number).expect("not in a stack");
+        let members = self.active(&self.stacks[&stack].clone());
+        let base_ref = self.prs[&members[0]].base_ref.clone();
+        let heads = self.branches();
+        let bottom_head = heads[&self.prs[&members[0]].head_ref].clone();
+        let fork = self.git(&["merge-base", &bottom_head, &heads[&base_ref]]);
+        let (mut previous_base, mut previous_old) = (base_ref, fork);
+        for number in members {
+            let head_ref = self.prs[&number].head_ref.clone();
+            let old_head = self.branches()[&head_ref].clone();
+            self.rebase_onto(number, &previous_old, &previous_base);
+            previous_base = head_ref;
+            previous_old = old_head;
         }
     }
 
