@@ -113,6 +113,48 @@ This is for when the second change literally won't work without the first.
 
    This is equivalent to calling `jj spr diff` on each change in your stack from `@-` back to `main@origin`.
 
+## Native GitHub Stacks
+
+By default, a dependent PR targets a base branch that jj-spr creates for it
+(`<prefix>main.<title>`), containing the files of the change below it. GitHub
+can also group dependent PRs into a
+[stack](https://docs.github.com/en/pull-requests/how-tos/stacked-pull-requests),
+shown as one unit in its UI. That requires each PR to target the PR branch of
+the change below it, which jj-spr does when native stacks are enabled:
+
+```shell
+jj config set --repo spr.nativeStacks true   # or pass --native-stack to jj spr diff
+jj spr diff --all
+```
+
+With native stacks:
+
+- Each PR targets its parent change's PR branch, and jj-spr creates no base
+  branches of its own. Updates still add a commit to the PR branch (with your
+  `-m` message), and each update commit merges in the parent PR's current head,
+  so GitHub keeps showing only the change itself.
+- After publishing, `jj spr diff` registers the chain as a GitHub stack, or
+  appends new PRs to the existing one. GitHub does not allow changing the base
+  of a stacked PR, so when you reorder, insert or remove changes, `jj spr diff
+  --all` dissolves the stack first and rebuilds it. It refuses to do that if
+  the stack contains PRs the run would not update; run it from the top of the
+  stack instead.
+- Without `--all`, a change stacks on its parent's existing PR, so the parent
+  must have been submitted already.
+- `jj spr land` only lands the bottom PR of a stack, and merges it through
+  GitHub's stack-aware merge. GitHub then retargets the next PR to the main
+  branch and rebases the rest of the stack. Afterwards, rebase your remaining
+  changes onto the main branch and run `jj spr diff --all`.
+- Existing PRs that use jj-spr base branches are moved over the next time you
+  run `jj spr diff --all`; the old base branches can be removed with
+  `jj spr cleanup`.
+- If stacked pull requests are not enabled for the repository, the PRs still
+  target each other; they just aren't registered as a GitHub stack.
+
+Limitations: repositories that merge through a merge queue are not supported
+yet, and a PR landed from a stack gets GitHub's default squash-commit message
+rather than one built from the PR description.
+
 ## Understanding Your Stack
 
 Use `jj log` to visualize your stack:
