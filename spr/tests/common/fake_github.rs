@@ -63,6 +63,18 @@ pub struct PullRequest {
     pub merge_commit_sha: Option<String>,
     pub last_head_sha: String,
     pub closed_reason: Option<String>,
+    /// Latest review per reviewer: (login, "APPROVED" | "CHANGES_REQUESTED").
+    pub reviews: Vec<(String, String)>,
+    pub threads: Vec<ReviewThread>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewThread {
+    pub path: String,
+    pub line: u64,
+    pub author: String,
+    pub body: String,
+    pub resolved: bool,
 }
 
 impl PullRequest {
@@ -99,6 +111,9 @@ pub struct State {
     pub stacks_enabled: bool,
     pub prs: BTreeMap<u64, PullRequest>,
     pub stacks: BTreeMap<u64, Vec<u64>>,
+    /// CI checks by commit: (name, "success" | "failure" | "pending"). Like
+    /// GitHub's, they belong to a head commit, so pushing clears them.
+    pub checks: HashMap<String, Vec<(String, String)>>,
     merge_ops: HashMap<u64, MergeOperation>,
     pub requests: Vec<Recorded>,
     /// Pull requests and stacks share one sequence of numbers, as on GitHub.
@@ -386,10 +401,25 @@ impl State {
         } else {
             pr.state.to_uppercase()
         };
+        let has = |wanted: &str| pr.reviews.iter().any(|(_, state)| state == wanted);
+        let decision = if has("CHANGES_REQUESTED") {
+            json!("CHANGES_REQUESTED")
+        } else if has("APPROVED") {
+            json!("APPROVED")
+        } else {
+            Value::Null
+        };
+        let reviews: Vec<Value> = pr
+            .reviews
+            .iter()
+            .map(|(login, state)| {
+                json!({"author": {"__typename": "User", "login": login}, "state": state})
+            })
+            .collect();
         json!({
             "number": pr.number,
             "state": state,
-            "reviewDecision": null,
+            "reviewDecision": decision,
             "isDraft": pr.draft,
             "title": pr.title,
             "body": pr.body,
@@ -398,9 +428,76 @@ impl State {
             "headRefOid": self.branches().get(&pr.head_ref).unwrap_or(&pr.last_head_sha),
             "mergeable": "MERGEABLE",
             "mergeCommit": pr.merge_commit_sha.as_ref().map(|oid| json!({"oid": oid})),
-            "latestOpinionatedReviews": {"nodes": []},
+            "latestOpinionatedReviews": {"nodes": reviews},
             "reviewRequests": {"nodes": []},
         })
+    }
+
+    fn graphql_pr_status(&self, number: u64) -> Value {
+        let pr = &self.prs[&number];
+        let head = self
+            .branches()
+            .get(&pr.head_ref)
+            .cloned()
+            .unwrap_or_else(|| pr.last_head_sha.clone());
+        let rollup = self
+            .checks
+            .get(&head)
+            .filter(|c| !c.is_empty())
+            .map(|checks| {
+                let nodes: Vec<Value> = checks
+                    .iter()
+                    .map(|(name, state)| {
+                        let (status, conclusion) = match state.as_str() {
+                            "pending" => ("IN_PROGRESS", Value::Null),
+                            other => ("COMPLETED", json!(other.to_uppercase())),
+                        };
+                        json!({"__typename": "CheckRun", "name": name, "status": status,
+                           "conclusion": conclusion})
+                    })
+                    .collect();
+                json!({"contexts": {"nodes": nodes}})
+            });
+        let threads: Vec<Value> = pr
+            .threads
+            .iter()
+            .map(|t| {
+                json!({"isResolved": t.resolved, "path": t.path, "line": t.line,
+                       "comments": {"nodes": [{"author": {"__typename": "User", "login": t.author},
+                                               "body": t.body}]}})
+            })
+            .collect();
+        json!({"statusCheckRollup": rollup, "reviewThreads": {"nodes": threads}})
+    }
+
+    /// Set the CI checks on a Pull Request's current head.
+    pub fn set_checks(&mut self, number: u64, checks: &[(&str, &str)]) {
+        let head = self.branches()[&self.prs[&number].head_ref].clone();
+        self.checks.insert(
+            head,
+            checks
+                .iter()
+                .map(|(name, state)| (name.to_string(), state.to_string()))
+                .collect(),
+        );
+    }
+
+    /// Record a review, replacing the reviewer's earlier one.
+    pub fn review(&mut self, number: u64, login: &str, state: &str) {
+        let pr = self.prs.get_mut(&number).expect("no such pull request");
+        pr.reviews.retain(|(l, _)| l != login);
+        pr.reviews.push((login.to_string(), state.to_string()));
+    }
+
+    pub fn add_thread(&mut self, number: u64, path: &str, line: u64, author: &str, body: &str) {
+        let pr = self.prs.get_mut(&number).expect("no such pull request");
+        pr.threads.push(ReviewThread {
+            path: path.into(),
+            line,
+            author: author.into(),
+            body: body.into(),
+            resolved: false,
+        });
     }
 
     // -- stacks ------------------------------------------------------------
@@ -665,6 +762,8 @@ impl State {
                         merged_at: None,
                         merge_commit_sha: None,
                         closed_reason: None,
+                        reviews: Vec::new(),
+                        threads: Vec::new(),
                     },
                 );
                 Ok((201, Some(self.pr_payload(number))))
@@ -887,6 +986,13 @@ impl State {
                     .map(|n| self.graphql_pr(n));
                 json!({"data": {"repository": {"pullRequest": data}}})
             }
+            "PullRequestStatusQuery" => {
+                let data = variables["number"]
+                    .as_u64()
+                    .filter(|n| self.prs.contains_key(n))
+                    .map(|n| self.graphql_pr_status(n));
+                json!({"data": {"repository": {"pullRequest": data}}})
+            }
             "OpenPullRequestBranchesQuery" => {
                 let nodes: Vec<Value> = self
                     .prs
@@ -949,6 +1055,7 @@ impl FakeGitHub {
             stacks_enabled,
             prs: BTreeMap::new(),
             stacks: BTreeMap::new(),
+            checks: HashMap::new(),
             merge_ops: HashMap::new(),
             requests: Vec::new(),
             next_number: 1,
