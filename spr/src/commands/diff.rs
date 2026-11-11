@@ -147,7 +147,7 @@ fn resolve_cherry_pick(
 }
 
 pub async fn diff(
-    opts: DiffOptions,
+    mut opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
@@ -275,6 +275,16 @@ pub async fn diff(
         }
     }
 
+    check_before_publishing(
+        &opts,
+        jj,
+        config,
+        &prepared_commits,
+        &pull_requests,
+        master_base_oid,
+    )
+    .await?;
+
     // With native stacks, GitHub refuses to change the base of a Pull Request
     // that is part of a stack. Work out up front which stacks this run is
     // about to invalidate, and dissolve them before changing anything; they
@@ -291,6 +301,22 @@ pub async fn diff(
             master_base_oid,
         );
         let to_dissolve = crate::stacks::plan_unstacks(&stacks, &planned).map_err(Error::new)?;
+        // Each updated Pull Request needs a message for its new commit. Ask
+        // now, once for all of them, so that aborting at the prompt leaves
+        // the stacks in place.
+        if !to_dissolve.is_empty() && opts.message.is_none() && !opts.dry_run {
+            let input = tokio::task::spawn_blocking(|| {
+                dialoguer::Input::<String>::new()
+                    .with_prompt("Message for the updated Pull Requests (leave empty to abort)")
+                    .allow_empty(true)
+                    .interact_text()
+            })
+            .await??;
+            if input.is_empty() {
+                return Err(Error::new("Aborted as per user request".to_string()));
+            }
+            opts.message = Some(input);
+        }
         for stack in to_dissolve {
             if opts.dry_run {
                 output(
@@ -499,6 +525,97 @@ fn plan_native_bases(
             }
         })
         .collect()
+}
+
+/// The checks `diff_impl` makes for each change, made for all of them before
+/// anything is pushed or any stack dissolved, so that a problem with one
+/// change does not leave the run half done.
+async fn check_before_publishing(
+    opts: &DiffOptions,
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    commits: &[crate::jj::PreparedCommit],
+    pull_requests: &[Option<PullRequest>],
+    master_base_oid: Oid,
+) -> Result<()> {
+    let closed: Vec<u64> = pull_requests
+        .iter()
+        .flatten()
+        .filter(|pr| pr.state == PullRequestState::Closed)
+        .map(|pr| pr.number)
+        .collect();
+    if !closed.is_empty() {
+        return Err(Error::new(format!(
+            "Not submitting: {} closed. If you want to open a new one, remove \
+             the 'Pull Request' section from the commit message.",
+            if closed.len() == 1 {
+                format!("Pull Request #{} is", closed[0])
+            } else {
+                format!(
+                    "Pull Requests {} are",
+                    crate::stacks::format_pr_list(&closed)
+                )
+            }
+        )));
+    }
+
+    for (commit, pull_request) in zip(commits, pull_requests) {
+        let label = || {
+            format!(
+                "{} {}",
+                commit.short_id,
+                commit
+                    .message
+                    .get(&MessageSection::Title)
+                    .map(String::as_str)
+                    .unwrap_or("(no title)")
+            )
+        };
+        if pull_request.is_none() || opts.update_message {
+            validate_commit_message(&commit.message)
+                .context(format!("Not submitting {}", label()))?;
+        }
+
+        let mut message = commit.message.clone();
+        let (cherry_pick, _) =
+            resolve_cherry_pick(opts.cherry_pick, opts.no_cherry_pick, &mut message);
+        if cherry_pick
+            && commit.parent_oid != master_base_oid
+            && jj.cherrypick(commit.oid, master_base_oid)?.has_conflicts()
+        {
+            return Err(Error::new(format!(
+                "Not submitting: {} cannot be cherry-picked on {}.",
+                label(),
+                config.master_ref.branch_name(),
+            )));
+        }
+
+        if pull_request.is_none()
+            && let Some(reviewers) = commit.message.get(&MessageSection::Reviewers)
+        {
+            for reviewer in parse_name_list(reviewers) {
+                let known = match reviewer.strip_prefix('#') {
+                    Some(slug) => GitHub::get_github_team((&config.owner).into(), slug.into())
+                        .await
+                        .is_ok(),
+                    None => GitHub::get_github_user(reviewer.clone()).await.is_ok(),
+                };
+                if !known {
+                    return Err(Error::new(format!(
+                        "Not submitting: the Reviewers field of {} contains unknown {} '{}'",
+                        label(),
+                        if reviewer.starts_with('#') {
+                            "team"
+                        } else {
+                            "user"
+                        },
+                        reviewer
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Refuse when a change's `Pull Request:` field is there but cannot be read,
