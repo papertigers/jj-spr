@@ -191,6 +191,26 @@ pub async fn diff(
         .get_pull_requests(prepared_commits.iter().map(|pc| pc.pull_request_number))
         .await?;
 
+    // A merged Pull Request cannot be updated, and pushing the rest of the
+    // stack on top of its local change would retarget them at its branch and
+    // dissolve their GitHub stack. `jj spr sync` abandons it instead.
+    let merged: Vec<u64> = pull_requests
+        .iter()
+        .flatten()
+        .filter(|pr| pr.state == PullRequestState::Merged)
+        .map(|pr| pr.number)
+        .collect();
+    if !merged.is_empty() {
+        let has = if merged.len() == 1 { "has" } else { "have" };
+        return Err(Error::new(format!(
+            "{} {has} already merged. Run `jj spr sync` to abandon the merged \
+             change(s) and rebase the rest of the stack onto {}, then run \
+             `jj spr diff` again.",
+            crate::stacks::format_pr_list(&merged),
+            config.trunk_revset(),
+        )));
+    }
+
     // Everything below compares against the Pull Requests' heads as fetched;
     // stop if one could not be fetched as GitHub reports it.
     for pr in pull_requests.iter().flatten() {

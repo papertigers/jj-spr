@@ -549,3 +549,31 @@ fn land_refuses_when_github_requires_a_review() {
     );
     assert!(env.pr(prs[0]).is_open());
 }
+
+#[test]
+fn diff_refuses_until_merged_changes_are_synced() {
+    // Merged on GitHub, but the local stack still has the merged change.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().merge_on_github(prs[0]);
+    let before: Vec<String> = prs[1..].iter().map(|&n| env.head_of(n)).collect();
+    let stacks_before = env.active_stacks();
+
+    let out = env.try_spr(&["diff", "--all", "-m", "before sync"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(
+        out.flat()
+            .contains(&format!("#{} has already merged", prs[0])),
+        "{}",
+        out.text
+    );
+    assert!(out.flat().contains("jj spr sync"), "{}", out.text);
+    let after: Vec<String> = prs[1..].iter().map(|&n| env.head_of(n)).collect();
+    assert_eq!(before, after, "nothing may be pushed");
+    assert_eq!(env.active_stacks(), stacks_before, "the stack must be kept");
+
+    env.spr(&["sync"]);
+    env.spr(&["diff", "--all", "-m", "after sync"]);
+    env.check_chain(&changes[1..]);
+}
