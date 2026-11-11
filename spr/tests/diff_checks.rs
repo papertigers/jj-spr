@@ -151,3 +151,52 @@ fn diff_refuses_a_change_linking_two_pull_requests() {
 fn diff_refuses_a_change_linking_two_pull_requests_without_stacks() {
     squash_two_submitted_changes_then_diff(false);
 }
+
+/// Submit A and B, then amend A, so a run that pushes before checking
+/// would change A's Pull Request.
+fn stack_with_amended_bottom(env: &TestEnv) -> (Vec<String>, Vec<u64>) {
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    std::fs::write(env.work.join("a.txt"), "a, amended\n").unwrap();
+    env.jj(&["squash", "--into", &changes[0]]);
+    (changes, prs)
+}
+
+/// `diff --all` refuses with `expect`, before pushing anything or touching
+/// the stack.
+fn assert_refused_before_changing_anything(env: &TestEnv, prs: &[u64], expect: &str) {
+    let before = heads(env, prs);
+    let stacks = env.active_stacks();
+    let out = env.try_spr(&["diff", "--all", "-m", "update"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(out.flat().contains(expect), "{}", out.text);
+    assert_eq!(heads(env, prs), before, "nothing may be pushed");
+    assert_eq!(env.active_stacks(), stacks, "the stack must be kept");
+}
+
+#[test]
+fn diff_checks_for_closed_pull_requests_before_pushing() {
+    // papertigers/jj-spr#16: A was pushed before diff found B's PR closed.
+    let env = TestEnv::new();
+    let (_, prs) = stack_with_amended_bottom(&env);
+    env.gh.state().close_on_github(prs[1]);
+    assert_refused_before_changing_anything(&env, &prs, &format!("#{}", prs[1]));
+}
+
+#[test]
+fn diff_checks_titles_before_pushing() {
+    let env = TestEnv::new();
+    let (_, prs) = stack_with_amended_bottom(&env);
+    std::fs::write(env.work.join("c.txt"), "c\n").unwrap();
+    env.jj(&["commit", "-m", ""]);
+    assert_refused_before_changing_anything(&env, &prs, "title");
+}
+
+#[test]
+fn diff_checks_reviewers_before_pushing() {
+    let env = TestEnv::new();
+    let (_, prs) = stack_with_amended_bottom(&env);
+    std::fs::write(env.work.join("c.txt"), "c\n").unwrap();
+    env.jj(&["commit", "-m", "Change C\n\nReviewers: nobody-at-all"]);
+    assert_refused_before_changing_anything(&env, &prs, "nobody-at-all");
+}
