@@ -140,8 +140,12 @@ With native stacks:
   stack instead.
 - Without `--all`, a change stacks on its parent's existing PR, so the parent
   must have been submitted already.
-- `jj spr land` only lands the bottom PR of a stack, and merges it through
-  GitHub's stack-aware merge. GitHub then retargets the next PR to the main
+- `jj spr land` merges through GitHub's stack-aware merge. Landing the bottom
+  PR merges just that one; landing a PR higher up merges it together with
+  every PR below it, after listing them and asking (pass `--yes` to skip the
+  question, which is required outside a terminal). Every PR that would merge
+  is checked first: none may be a draft, and each must be approved if
+  `spr.requireApproval` is set. GitHub then retargets the next PR to the main
   branch and rebases the rest of the stack. Afterwards, run `jj spr sync` and
   then `jj spr diff --all`.
 - Existing PRs that use jj-spr base branches are moved over the next time you
