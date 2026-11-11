@@ -67,7 +67,8 @@ enum Commands {
     /// List open Pull Requests on GitHub and their review decision
     List,
 
-    /// Create a new branch with the contents of an existing Pull Request
+    /// Create local changes from an existing Pull Request, or from every
+    /// Pull Request in its native GitHub stack
     Patch(commands::patch::PatchOptions),
 
     /// Close a Pull request
