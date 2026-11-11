@@ -172,14 +172,11 @@ pub async fn diff(
     };
 
     // Determine the master base OID - this is the commit on master that the stack is based on
+    // When the bottom change is not directly on master (`-r a..c` above
+    // another change), it is stacked on its parent's Pull Request, in range
+    // mode as in single-change mode.
     let master_base_oid = if let Some(first_commit) = prepared_commits.first() {
-        if use_range_mode {
-            // For range mode, the parent of the first commit is the master base
-            first_commit.parent_oid
-        } else {
-            // For single commit mode, find the actual merge base with master
-            jj.get_master_base_for_commit(config, first_commit.oid)?
-        }
+        jj.get_master_base_for_commit(config, first_commit.oid)?
     } else {
         output("👋", "No commits found - nothing to do. Good bye!")?;
         return result;
