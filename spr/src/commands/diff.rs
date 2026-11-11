@@ -282,6 +282,43 @@ pub async fn diff(
     )
     .await?;
 
+    // In single-change mode a stacked Pull Request whose base has to change
+    // cannot be updated (GitHub refuses, and the stack is not rebuilt here),
+    // so stop before pushing its new head.
+    if native
+        && !use_range_mode
+        && let (Some(commit), Some(Some(pr))) = (prepared_commits.first(), pull_requests.first())
+        && pr.state == PullRequestState::Open
+        && !wants_cherry_pick(&opts, &commit.message)
+    {
+        let expected_base = if commit.parent_oid == master_base_oid {
+            Some(config.master_ref.branch_name().to_string())
+        } else {
+            match jj
+                .prepare_commit(config, commit.parent_oid)?
+                .pull_request_number
+            {
+                Some(n) => Some(gh.get_pull_request(n).await?.head.branch_name().to_string()),
+                None => None,
+            }
+        };
+        if let Some(expected) = expected_base
+            && expected != pr.base.branch_name()
+            && let Some(stack) = gh.stack_containing(pr.number).await?
+        {
+            return Err(Error::new(format!(
+                "Not submitting: #{} is in GitHub stack #{}, and its base would have \
+                 to change from {} to {}, which GitHub does not allow for a stacked \
+                 Pull Request. Run `jj spr diff --all` (or `-r <top of the stack>`) \
+                 to rebuild the stack with the new order.",
+                pr.number,
+                stack.number,
+                pr.base.branch_name(),
+                expected
+            )));
+        }
+    }
+
     // With native stacks, GitHub refuses to change the base of a Pull Request
     // that is part of a stack. Work out up front which stacks this run is
     // about to invalidate, and dissolve them before changing anything; they

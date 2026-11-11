@@ -232,3 +232,22 @@ fn diff_range_not_starting_on_main_stacks_on_the_parents_pr() {
     assert_eq!(env.pr(pb).base_ref, env.pr(pa).head_ref);
     assert_eq!(env.pr_files(pb), vec!["b.txt"]);
 }
+
+#[test]
+fn diff_of_one_stacked_change_refuses_a_base_change_before_pushing() {
+    // papertigers/jj-spr#22: single-change mode pushed B, then failed to
+    // change its base, which GitHub refuses for a PR in a stack.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    env.jj(&["rebase", "-r", &changes[1], "-d", "main@origin"]);
+    let before = heads(&env, &prs);
+    let stacks = env.active_stacks();
+
+    let out = env.try_spr(&["diff", "-r", &changes[1], "-m", "move B"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(out.flat().contains("jj spr diff --all"), "{}", out.text);
+    assert!(out.flat().contains(&format!("#{}", prs[1])), "{}", out.text);
+    assert_eq!(heads(&env, &prs), before, "nothing may be pushed");
+    assert_eq!(env.active_stacks(), stacks, "the stack must be kept");
+}
