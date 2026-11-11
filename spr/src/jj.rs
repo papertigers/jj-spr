@@ -408,6 +408,11 @@ impl Jujutsu {
     /// contains its diff, or if its diff is that of a version of the local
     /// change from `jj evolog` (the one last pushed; after a stacked merge
     /// GitHub rebases that onto a new base, so the trees can differ).
+    ///
+    /// It is also fine if the local parent contains the diff. GitHub's stack
+    /// rebase can leave a branch holding only the content of the Pull
+    /// Request below it, which the local change need not contain (it may
+    /// undo some of it), but which pushing does not lose.
     pub fn pr_has_remote_changes(
         &self,
         config: &Config,
@@ -424,6 +429,10 @@ impl Jujutsu {
 
         let local_tree = self.get_tree_oid_for_commit(local.oid)?;
         if self.tree_contains_diff(local_tree, fork_tree, head_tree)? {
+            return Ok(false);
+        }
+        let parent_tree = self.get_tree_oid_for_commit(local.parent_oid)?;
+        if self.tree_contains_diff(parent_tree, fork_tree, head_tree)? {
             return Ok(false);
         }
         for version in self.evolog(local.oid)? {

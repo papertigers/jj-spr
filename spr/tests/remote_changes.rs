@@ -191,3 +191,84 @@ fn diff_refuses_colleagues_push_after_github_rebase() {
     );
     let _ = e;
 }
+
+/// Rewrite the branches of `prs[1]` and `prs[2]` the way GitHub's stack
+/// rebase did in oxidecomputer/propolis#1242-#1245: each branch keeps only
+/// the content of the PR below it, and its own change is dropped.
+fn shift_branches_down(env: &TestEnv, prs: &[u64]) {
+    let a_head = env.head_of(prs[0]);
+    let b_head = env.head_of(prs[1]);
+    let b_branch = env.pr(prs[1]).head_ref;
+    let c_branch = env.pr(prs[2]).head_ref;
+    let b_lossy = env.remote_git(&[
+        "commit-tree",
+        &format!("{a_head}^{{tree}}"),
+        "-p",
+        &a_head,
+        "-m",
+        "[spr] changes to main this commit is based on",
+    ]);
+    let c_lossy = env.remote_git(&[
+        "commit-tree",
+        &format!("{b_head}^{{tree}}"),
+        "-p",
+        &b_lossy,
+        "-m",
+        "[spr] changes to main this commit is based on",
+    ]);
+    env.remote_git(&["update-ref", &format!("refs/heads/{b_branch}"), &b_lossy]);
+    env.remote_git(&["update-ref", &format!("refs/heads/{c_branch}"), &c_lossy]);
+    // `jj spr sync` fetches, so the rewritten heads are local.
+    env.jj(&["git", "fetch"]);
+}
+
+/// A stack where C removes a line B adds, so B's diff is not in C.
+fn build_stack_where_c_undoes_part_of_b(env: &TestEnv) -> Vec<String> {
+    let a = env.commit("Change A", "shared.txt", "one\ntwo\n");
+    let b = env.commit("Change B", "shared.txt", "one\nnote\ntwo\n");
+    let c = env.commit("Change C", "shared.txt", "one\ntwo\n");
+    env.spr(&["diff", "--all", "-m", "initial"]);
+    // B moves on after C exists (as #1243 did), so no earlier version of C
+    // happens to have B's current tree.
+    std::fs::write(env.work.join("b.txt"), "b\n").unwrap();
+    env.jj(&["squash", "--into", &b]);
+    env.spr(&["diff", "--all", "-m", "edit B"]);
+    vec![a, b, c]
+}
+
+#[test]
+fn diff_allows_branch_holding_only_the_parents_content() {
+    // GitHub's restack left #1244 holding #1243's diff, which adds lines
+    // #1244 deletes. That diff is all in the local parent, so pushing over
+    // it drops nothing.
+    let env = TestEnv::new();
+    let changes = build_stack_where_c_undoes_part_of_b(&env);
+    let prs = env.prs_for(&changes);
+    shift_branches_down(&env, &prs);
+
+    env.spr(&["diff", "--all", "-m", "after GitHub's restack"]);
+    env.check_chain(&changes);
+}
+
+#[test]
+fn diff_refuses_colleagues_push_on_top_of_parents_content() {
+    // As above, but someone also pushed to C: that is still their work.
+    let env = TestEnv::new();
+    let changes = build_stack_where_c_undoes_part_of_b(&env);
+    let prs = env.prs_for(&changes);
+    shift_branches_down(&env, &prs);
+    env.push_to_pr_branch(prs[2], "c-fix.txt", "fix\n");
+    let before = heads(&env, &prs);
+
+    let out = env.try_spr(&["diff", "--all", "-m", "would drop the push"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains(&format!(
+            "#{} has commits that are not in the local change",
+            prs[2]
+        )),
+        "{}",
+        out.text
+    );
+    assert_eq!(heads(&env, &prs), before, "nothing may be pushed");
+}
