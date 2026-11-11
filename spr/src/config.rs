@@ -43,8 +43,8 @@ impl Config {
     pub fn pull_request_url(&self, number: u64) -> String {
         format!(
             "https://github.com/{owner}/{repo}/pull/{number}",
-            owner = &self.owner,
-            repo = &self.repo
+            owner = self.owner,
+            repo = self.repo
         )
     }
 
@@ -84,7 +84,7 @@ impl Config {
     ) -> String {
         self.find_unused_branch_name(
             existing_ref_names,
-            &format!("{}.{}", self.master_ref.branch_name(), &slugify(title)),
+            &format!("{}.{}", self.master_ref.branch_name(), slugify(title)),
         )
     }
 
