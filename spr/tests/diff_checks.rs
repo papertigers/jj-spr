@@ -102,3 +102,52 @@ fn diff_refuses_a_change_with_its_parents_pull_request() {
     assert!(out.flat().contains(&format!("#{}", prs[1])), "{}", out.text);
     assert_eq!(heads(&env, &prs), before, "nothing may be pushed");
 }
+
+fn squash_two_submitted_changes_then_diff(stacks_enabled: bool) {
+    let env = TestEnv::with_stacks(stacks_enabled);
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    // Keep both descriptions, as `jj squash` does in an editor.
+    env.jj(&[
+        "--config",
+        "ui.editor=\"true\"",
+        "squash",
+        "-r",
+        &changes[1],
+    ]);
+    let description = env.jj_query(&["log", "--no-graph", "-r", &changes[0], "-T", "description"]);
+    assert_eq!(
+        description.matches("Pull Request:").count(),
+        2,
+        "{description}"
+    );
+    let before = heads(&env, &[prs[0], prs[2]]);
+    let stacks = env.active_stacks();
+
+    let out = env.try_spr(&["diff", "--all", "-m", "after squash"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    let text = out.flat();
+    assert!(text.contains("more than one Pull Request"), "{}", out.text);
+    assert!(text.contains(&format!("/pull/{}", prs[0])), "{}", out.text);
+    assert!(text.contains(&format!("/pull/{}", prs[1])), "{}", out.text);
+    assert!(!out.text.contains("Created new"), "{}", out.text);
+    assert_eq!(
+        heads(&env, &[prs[0], prs[2]]),
+        before,
+        "nothing may be pushed"
+    );
+    assert_eq!(env.active_stacks(), stacks, "the stack must be kept");
+}
+
+#[test]
+fn diff_refuses_a_change_linking_two_pull_requests() {
+    // papertigers/jj-spr#13: squashing two submitted changes combined their
+    // `Pull Request:` lines, which could not be read, so diff opened a new
+    // PR and left both old ones open.
+    squash_two_submitted_changes_then_diff(true);
+}
+
+#[test]
+fn diff_refuses_a_change_linking_two_pull_requests_without_stacks() {
+    squash_two_submitted_changes_then_diff(false);
+}

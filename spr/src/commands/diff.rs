@@ -199,6 +199,7 @@ pub async fn diff(
         )));
     }
 
+    refuse_unreadable_pull_request_lines(jj, config, &prepared_commits)?;
     refuse_shared_pull_requests(jj, config, &prepared_commits)?;
 
     let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
@@ -498,6 +499,64 @@ fn plan_native_bases(
             }
         })
         .collect()
+}
+
+/// Refuse when a change's `Pull Request:` field is there but cannot be read,
+/// which `jj squash` of two submitted changes causes by keeping both lines.
+/// Treating it as no Pull Request would open a new one and orphan the old.
+fn refuse_unreadable_pull_request_lines(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    commits: &[crate::jj::PreparedCommit],
+) -> Result<()> {
+    let unreadable: Vec<&crate::jj::PreparedCommit> = commits
+        .iter()
+        .filter(|c| c.pull_request_number.is_none())
+        .filter(|c| {
+            c.message
+                .get(&MessageSection::PullRequest)
+                .is_some_and(|field| !field.trim().is_empty())
+        })
+        .collect();
+    let Some(first) = unreadable.first() else {
+        return Ok(());
+    };
+    let field = first.message[&MessageSection::PullRequest].trim();
+    let lines: Vec<&str> = field
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let links: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| config.parse_pull_request_field(l).is_some())
+        .collect();
+    let owned: Vec<crate::jj::PreparedCommit> = vec![(*first).clone()];
+    let id = jj
+        .change_ids_for(&owned)?
+        .get(&first.oid)
+        .map(|id| crate::jj::short(id).to_string())
+        .unwrap_or_else(|| first.short_id.clone());
+    let (what, shown) = if links.len() > 1 {
+        (
+            "links more than one Pull Request (as after `jj squash` of two \
+             submitted changes)",
+            links,
+        )
+    } else {
+        ("has a `Pull Request:` line that jj-spr cannot read", lines)
+    };
+    Err(Error::new(format!(
+        "Not submitting: {id} {what}:\n{}\nKeep one `Pull Request:` line (with \
+         `jj describe`), and close the other Pull Request on GitHub if it is no \
+         longer needed.",
+        shown
+            .iter()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )))
 }
 
 /// Refuse when two changes link the same Pull Request: the selected ones,
